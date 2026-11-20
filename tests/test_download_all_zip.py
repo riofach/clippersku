@@ -41,7 +41,9 @@ def test_same_second_downloads_get_separate_zips(tmp_path, monkeypatch):
     assert first.path != second.path
     for resp in (first, second):
         with zipfile.ZipFile(resp.path) as zf:
-            assert sorted(zf.namelist()) == ["clip_01_clip_a.mp4", "clip_02_clip_b.mp4"]
+            assert sorted(zf.namelist()) == [
+                "Judul-dan-caption.txt", "clip_01_clip_a.mp4", "clip_02_clip_b.mp4",
+            ]
             assert zf.testzip() is None
 
     # Each cleanup removes only its own file, and a repeat is harmless.

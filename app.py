@@ -8123,13 +8123,15 @@ def _clip_scene_workfile(source_path, segments, output_dir, token):
     return work_path
 
 
-async def _scene_editor_input(job_id, clip_index, request):
+async def _scene_editor_input(job_id, clip_index, request, *, limit_scenes=False):
     await require_managed_entitlement(request)
     await _ensure_job_files(job_id, request)
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     job = jobs[job_id]
     await _assert_job_owner(request, job)
+    if limit_scenes:
+        _check_editor_rate(await _owner_id(request), bucket="scenes")
     output_dir = os.path.join(OUTPUT_DIR, job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
@@ -8162,7 +8164,7 @@ async def _scene_editor_input(job_id, clip_index, request):
 async def get_clip_scenes(job_id: str, clip_index: int, request: Request):
     """List uncropped scene stills. Encode a playable preview only on demand."""
     data, clip, segments, source_path, cache = await _scene_editor_input(
-        job_id, clip_index, request)
+        job_id, clip_index, request, limit_scenes=True)
 
     def build():
         import cv2
@@ -8225,7 +8227,6 @@ async def get_clip_scenes(job_id: str, clip_index: int, request: Request):
         async with lock:
             cached = cache.load()
             if cached is None:
-                _check_editor_rate(await _owner_id(request), bucket="scenes")
                 try:
                     cached = await asyncio.to_thread(build)
                 except Exception as e:
