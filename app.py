@@ -22,7 +22,7 @@ import signal
 import socket
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Literal
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -1650,7 +1650,8 @@ async def _deliver(request, job_id, filename):
     if watermarked.hihuclip_enabled():
         path = os.path.join(OUTPUT_DIR, job_id, filename)
         try:
-            return os.path.basename(await asyncio.to_thread(watermarked.mark_hihuclip_delivery, path))
+            name = watermarked.hihuclip_name(OUTPUT_DIR)
+            return os.path.basename(await asyncio.to_thread(watermarked.mark_hihuclip_delivery, path, name=name))
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             print(f"HihuClip export failed for {job_id}: {exc}")
             raise HTTPException(status_code=500, detail="Could not apply the HihuClip watermark") from exc
@@ -5679,6 +5680,28 @@ async def worker_done(job_id: str, request: Request):
 PUBLIC_CONFIG_CACHE = "public, max-age=300"
 
 
+class WatermarkSettingsRequest(BaseModel):
+    name: str
+
+
+@app.get("/api/settings/watermark")
+async def get_watermark_settings():
+    if BILLING_ENABLED or not watermarked.hihuclip_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"name": watermarked.hihuclip_name(OUTPUT_DIR), "max_length": watermarked.MAX_NAME_LENGTH}
+
+
+@app.put("/api/settings/watermark")
+async def save_watermark_settings(settings: WatermarkSettingsRequest):
+    if BILLING_ENABLED or not watermarked.hihuclip_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        name = watermarked.save_hihuclip_name(OUTPUT_DIR, settings.name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"name": name, "max_length": watermarked.MAX_NAME_LENGTH}
+
+
 @app.get("/api/config")
 async def get_config(response: Response):
     response.headers["Cache-Control"] = PUBLIC_CONFIG_CACHE
@@ -7218,7 +7241,7 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
 
 from editor import VideoEditor
 from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, CAPTION_PRESETS
-from hooks import add_hook_to_video
+from hooks import add_hook_to_video, HOOK_SIZE_SCALES
 from translate import translate_video, get_supported_languages
 from thumbnail import (analyze_video_for_titles, refine_titles, generate_thumbnail,
                        generate_youtube_description, extract_face_frames)
@@ -8050,8 +8073,10 @@ async def _set_clip_mode_locked(req: ClipModeRequest, request: Request, job):
                         os.path.join(output_dir, name), hook['text'],
                         os.path.join(output_dir, hooked),
                         position=hook.get('position') or "auto",
+                        font_scale=HOOK_SIZE_SCALES.get(hook.get('size'), 1.0),
                         duration=hook.get('duration_seconds'),
                         style=hook.get('style') or "pill", font=hook.get('font'),
+                        intro_blur=hook.get('intro_blur', False),
                         layout_ranges=clip.get('layout_ranges'),
                         has_captions=had_captions)
                     name = hooked
@@ -8247,35 +8272,65 @@ async def get_clip_scenes(job_id: str, clip_index: int, request: Request):
     aspect = 1.0 if data.get('output_format') == 'square' else 9.0 / 16.0
     crop_w = min(orig_w, orig_h * aspect)
     preset = data.get('layout_preset')
+    from reframe_v2 import delivery_size
+    out_w, out_h = delivery_size(orig_w, orig_h, aspect)
     fallback = None
     grid_defaults = None
     if aspect == 9.0 / 16.0:
-        from reframe_v2 import delivery_size
-        out_w, out_h = delivery_size(orig_w, orig_h, aspect)
         grid_defaults = preset_layout.fractions(
             preset_layout.initial_boxes(preset_layout.PANEL, orig_w, orig_h, out_w, out_h),
             orig_w, orig_h)
     if preset in preset_layout.PRESETS and grid_defaults is not None:
         fallback = preset_layout.fractions(
             preset_layout.initial_boxes(preset, orig_w, orig_h, out_w, out_h), orig_w, orig_h)
-        ranges = layout_ranges.normalise(clip.get('layout_ranges'))
-        for scene in scenes_out:
-            mid = (scene['start'] + scene['end']) / 2
-            match = next((r for r in ranges
-                          if r.get('layout') == preset and r.get('boxes')
-                          and r['start'] <= mid < r['end']), None)
-            scene['preset_boxes'] = match['boxes'] if match else fallback
-            scene['preset_applied'] = bool(match)
+    ranges = layout_ranges.normalise(clip.get('layout_ranges'))
+    saved_overrides = clip.get('crop_overrides') or {}
+    half = crop_w / (2 * orig_w)
+
+    def legacy_point(value):
+        if isinstance(value, dict):
+            return float(value['x']) * orig_w, float(value.get('y', .5)) * orig_h
+        return float(value) * orig_w, .5 * orig_h
+
+    def split_fractions(centres):
+        return preset_layout.fractions(
+            preset_layout.split_boxes(orig_w, orig_h, out_w, out_h, centres), orig_w, orig_h)
+
+    for scene in scenes_out:
+        mid = (scene['start'] + scene['end']) / 2
+        match = next((r for r in ranges if r['start'] <= mid < r['end']), {})
+        if fallback:
+            matches_preset = match.get('layout') == preset and bool(match.get('boxes'))
+            scene['preset_boxes'] = match['boxes'] if matches_preset else fallback
+            scene['preset_applied'] = matches_preset
+        if match.get('layout') == 'split' and match.get('boxes'):
+            scene['rendered_split_boxes'] = match['boxes']
+
+        override = saved_overrides.get(str(scene['index']))
+        x = override if isinstance(override, (float, int)) else scene.get('suggested_center', .5)
+        y = scene.get('suggested_center_y', .5)
+        centres = [(min(1 - half, max(half, x + offset)) * orig_w, y * orig_h)
+                   for offset in (-.2, .2)]
+        scene['split_defaults'] = split_fractions(centres)
+        if isinstance(override, dict) and 'top' in override and 'bottom' in override:
+            # Saved splits before the rectangle editor stored points per half.
+            try:
+                scene['legacy_split_boxes'] = split_fractions(
+                    [legacy_point(override[key]) for key in ('top', 'bottom')])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
     return {
         "job_id": job_id,
         "clip_index": clip_index,
         "source_width": orig_w,
         "source_height": orig_h,
+        "output_width": out_w,
+        "output_height": out_h,
         "crop_width_fraction": round(crop_w / orig_w, 4),
         "scene_key": cache.key,
         "preview_url": f"/videos/{job_id}/{cache.preview.name}" if cache.preview.is_file() else None,
         "preview_request_url": f"/api/clip/{job_id}/{clip_index}/scene-preview/{cache.key}",
-        "saved_overrides": clip.get('crop_overrides') or {},
+        "saved_overrides": saved_overrides,
         "layout_preset": preset,
         "preset_defaults": fallback,
         "grid_defaults": grid_defaults,
@@ -8449,6 +8504,8 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
         ranges = layout_ranges.read(path)
         add_hook_to_video(path, hook['text'], out, position=hook.get('position') or 'auto',
                           style=hook.get('style') or 'pill', font=hook.get('font'),
+                          font_scale=HOOK_SIZE_SCALES.get(hook.get('size'), 1.0),
+                          intro_blur=hook.get('intro_blur', False),
                           duration=hook.get('duration_seconds'), layout_ranges=ranges,
                           has_captions=bool(v_transcript))
         layout_ranges.write(out, [(r['start'], r['end'], r['layout'], r.get('content'),
@@ -8514,8 +8571,16 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
+        if isinstance(e, HTTPException):
+            raise
+        cause = e.__cause__ or e
+        stderr = getattr(cause, 'stderr', None)
+        if stderr:
+            report = stderr.decode(errors='replace') if isinstance(stderr, bytes) else str(stderr)
+            print(f"Reframe FFmpeg: {report[-600:]}")
         print(f"Reframe Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500,
+                            detail="Could not render the new framing. Your previous clip is still available.") from e
 
 
 # --- Remotion Render Proxy ---
@@ -9027,8 +9092,88 @@ class HookRequest(BaseModel):
     size: Optional[str] = "M" # S, M, L
     duration_seconds: Optional[float] = None  # None = hook visible for the whole clip
     style: Optional[str] = "pill"  # pill/classic/dark/yellow/red/outline/outline_yellow
-    font: Optional[str] = None  # montserrat/anton/serif (hooks.HOOK_FONTS); None = the style's own
+    font: Optional[str] = None  # hooks.HOOK_FONTS; None = the style's typeface
+    intro_blur: bool = False
     remove: Optional[bool] = False  # strip the burned hook instead of adding one
+
+
+def _hook_source(output_dir, filename, canonical=None):
+    uncaptioned = _strip_burned_captions(output_dir, filename, materialize=False)
+    base = _strip_burned_hook(output_dir, uncaptioned)
+    if base != canonical and re.match(r'^(?:wm_|subtitled_\d+_)*(?:hooked_\d+_|hook_)', base):
+        raise HTTPException(status_code=409,
+                            detail="The video before the previous hook is no longer available.")
+    if not os.path.isfile(os.path.join(output_dir, base)):
+        raise HTTPException(status_code=404, detail="The hook's source video is unavailable.")
+    return base, uncaptioned != _strip_watermark_copy(output_dir, filename)
+
+
+def _hook_canonical_name(metadata_path, clip_index):
+    stem = os.path.basename(metadata_path).removesuffix('_metadata.json')
+    return f"{stem}_clip_{clip_index + 1}.mp4"
+
+
+async def _editor_preview_file(job_id, clip_index, request, layer):
+    await require_managed_entitlement(request)
+    await _ensure_job_files(job_id, request)
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, job)
+    clips = (job.get('result') or {}).get('clips') or []
+    if not 0 <= clip_index < len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    filename = os.path.basename(clips[clip_index].get('video_url') or '')
+    canonical = _hook_canonical_name(json_files[0], clip_index)
+    if layer == "subtitles":
+        uncaptioned = _strip_burned_captions(output_dir, filename, materialize=False)
+        if not re.match(r'^(?:wm_)?subtitled_\d+_', uncaptioned):
+            path = os.path.join(output_dir, uncaptioned)
+            if os.path.isfile(path):
+                return path
+        # Old jobs may only keep the hooked version as a recipe. Preview the
+        # base video without encoding a second copy just to open the editor.
+    source, _ = _hook_source(output_dir, filename, canonical)
+    path = os.path.join(output_dir, source)
+    if layer == "subtitles" and re.match(r'^(?:wm_)?subtitled_\d+_', source):
+        raise HTTPException(status_code=409, detail="The clip before subtitles is unavailable.")
+    return path
+
+
+async def _editor_preview_url(job_id, clip_index, request, layer):
+    path = await _editor_preview_file(job_id, clip_index, request, layer)
+    filename = os.path.basename(path)
+    if _media_guard(f"{job_id}/{filename}"):
+        return {"video_url": f"/videos/{job_id}/{filename}"}
+    if not BILLING_ENABLED and watermarked.hihuclip_enabled():
+        return {"video_url": f"/api/clip/{job_id}/{clip_index}/editor-preview/video?layer={layer}"}
+    raise HTTPException(status_code=409, detail="The editable preview is unavailable for this clip.")
+
+
+@app.get("/api/clip/{job_id}/{clip_index}/hook-preview")
+async def get_hook_preview(job_id: str, clip_index: int, request: Request):
+    return await _editor_preview_url(job_id, clip_index, request, "hook")
+
+
+@app.get("/api/clip/{job_id}/{clip_index}/subtitle-preview")
+async def get_subtitle_preview(job_id: str, clip_index: int, request: Request):
+    return await _editor_preview_url(job_id, clip_index, request, "subtitles")
+
+
+@app.get("/api/clip/{job_id}/{clip_index}/editor-preview/video")
+async def stream_local_editor_preview(job_id: str, clip_index: int, request: Request,
+                                      layer: Literal["hook", "subtitles"]):
+    # The general /videos guard still protects delivery copies and hosted
+    # plans. The local editor resolves this file from its clip index only.
+    if BILLING_ENABLED or not watermarked.hihuclip_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    path = await _editor_preview_file(job_id, clip_index, request, layer)
+    return FileResponse(path, media_type="video/mp4", headers={"Cache-Control": "no-store"})
+
 
 @app.post("/api/hook")
 async def add_hook(req: HookRequest, request: Request):
@@ -9049,7 +9194,7 @@ async def add_hook(req: HookRequest, request: Request):
         data = json.load(f)
         
     clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    if not 0 <= req.clip_index < len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
         
     clip_data = clips[req.clip_index]
@@ -9075,11 +9220,8 @@ async def add_hook(req: HookRequest, request: Request):
     # second caption layer (see _reapply_captions). The hook layer is stripped
     # too: a new hook REPLACES the burned one (auto-hook or a previous manual
     # one) instead of stacking on top of it.
-    clean_name = _strip_burned_captions(output_dir, filename, materialize=False)
-    had_captions = clean_name != filename
-    clean_name = _strip_burned_hook(output_dir, clean_name)
-    filename = clean_name
-    input_path = os.path.join(output_dir, clean_name)
+    filename, had_captions = _hook_source(output_dir, filename, _hook_canonical_name(json_files[0], req.clip_index))
+    input_path = os.path.join(output_dir, filename)
 
     if req.remove:
         # Nothing to burn: the hook-less file is the target; captions (if the
@@ -9088,12 +9230,11 @@ async def add_hook(req: HookRequest, request: Request):
         output_path = input_path
         reservation_id = None
     else:
-        output_filename = f"hooked_{int(time.time())}_{filename}"
+        output_filename = f"hooked_{time.time_ns()}_{filename}"
         output_path = os.path.join(output_dir, output_filename)
 
         # Map Size to Scale
-        size_map = {"S": 0.8, "M": 1.0, "L": 1.3}
-        font_scale = size_map.get(req.size, 1.0)
+        font_scale = HOOK_SIZE_SCALES.get(req.size, 1.0)
 
         # Meter the FFmpeg overlay re-encode (no-op for BYOK / self-host).
         hook_minutes = _cloud_config.EDITOR_ACTION_MINUTES if BILLING_ENABLED else 0
@@ -9106,7 +9247,7 @@ async def add_hook(req: HookRequest, request: Request):
                 return add_hook_to_video(
                     input_path, req.text, output_path, position=req.position or "auto",
                     font_scale=font_scale, duration=req.duration_seconds, style=req.style,
-                    font=req.font, layout_ranges=clip_data.get('layout_ranges'),
+                    font=req.font, intro_blur=req.intro_blur, layout_ranges=clip_data.get('layout_ranges'),
                     has_captions=had_captions)
 
             loop = asyncio.get_event_loop()
@@ -9125,8 +9266,13 @@ async def add_hook(req: HookRequest, request: Request):
     if had_captions:
         recap = await asyncio.get_event_loop().run_in_executor(
             None, _reapply_captions, req.job_id, req.clip_index, output_path)
-        if recap:
-            output_filename = os.path.basename(recap)
+        if not recap:
+            if not req.remove:
+                with suppress(OSError):
+                    os.remove(output_path)
+            raise HTTPException(status_code=500,
+                                detail="Could not preserve the subtitles. Your previous clip is still available.")
+        output_filename = os.path.basename(recap)
 
     output_filename = await _deliver(request, req.job_id, output_filename)
 
@@ -9137,7 +9283,7 @@ async def add_hook(req: HookRequest, request: Request):
     else:
         clip_data['auto_hook'] = {
             "text": req.text, "style": req.style, "font": req.font, "position": req.position,
-            "duration_seconds": req.duration_seconds,
+            "size": req.size, "duration_seconds": req.duration_seconds, "intro_blur": req.intro_blur,
         }
 
     # Update Persistence (Same logic as subtitles)

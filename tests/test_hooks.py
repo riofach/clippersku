@@ -1,7 +1,10 @@
 """Tests for hook overlay text handling (emoji runs, long-word wrapping,
 visual styles, bitmap-emoji scaling, image generation)."""
 import os
+import shutil
+import subprocess
 
+import pytest
 from PIL import Image, ImageDraw, ImageFont
 
 from hooks import (
@@ -11,6 +14,7 @@ from hooks import (
     _measure_width,
     _split_emoji_runs,
     _EMOJI_RE,
+    add_hook_to_video,
     create_hook_image,
 )
 
@@ -145,3 +149,30 @@ def test_pill_hook_image_stacks_one_box_per_line(tmp_path):
     alpha_rows = [any(img.getpixel((x, y))[3] > 200 for x in range(0, img.width, 4))
                   for y in range(img.height)]
     assert sum(alpha_rows) > 0
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="needs FFmpeg")
+def test_intro_blur_fades_out_under_the_hook(tmp_path):
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "hooked.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+        "color=black:s=320x180:r=20:d=3,drawbox=x=160:y=0:w=160:h=180:c=white:t=fill",
+        "-c:v", "libx264", str(source),
+    ], check=True, timeout=30)
+    add_hook_to_video(str(source), "INTRO", str(output), position="bottom", duration=3,
+                      font="barlow", intro_blur=True)
+
+    def edge_sample(time):
+        frame = subprocess.check_output([
+            "ffmpeg", "-v", "error", "-ss", str(time), "-i", str(output), "-frames:v", "1",
+            "-vf", "crop=2:2:158:40", "-pix_fmt", "gray", "-f", "rawvideo", "pipe:1",
+        ], timeout=10)
+        return frame[0]
+
+    blurred = edge_sample(.5)
+    fading = edge_sample(2.25)
+    clear = edge_sample(2.75)
+    assert blurred > fading > clear
+    assert blurred > 60 and clear < 10

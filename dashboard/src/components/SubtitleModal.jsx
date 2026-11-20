@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2 } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { apiFetch, apiJson } from '../lib/api';
+import { getApiUrl } from '../config';
 import RemotionPreview from './RemotionPreview';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
@@ -115,11 +116,11 @@ const swatchClass = (selected) =>
         ? 'ring-2 ring-[color:var(--color-accent)] ring-offset-2 ring-offset-[color:var(--color-paper-2)]'
         : 'ring-1 ring-[color:var(--color-rule-2)] hover:ring-[color:var(--color-accent)]'}`;
 
-export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress }) {
+export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, savedFontSize, bulkCount = 0, bulkProgress }) {
     // Opens on the look the clip already has (the Default preset), so
     // "apply" without touching anything changes nothing.
     const [position, setPosition] = useState('bottom');
-    const [fontSize, setFontSize] = useState(40);
+    const [fontSize, setFontSize] = useState(() => Math.max(10, Math.min(200, savedFontSize ?? 40)));
     const [fontName, setFontName] = useState('Anton');
     const [fontColor, setFontColor] = useState('#FFFFFF');
     const [highlightColor, setHighlightColor] = useState('#FFE500');
@@ -174,6 +175,23 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const [durationSec, setDurationSec] = useState(30);
     const [captionsLoading, setCaptionsLoading] = useState(false);
     const [useRemotionPreview, setUseRemotionPreview] = useState(false);
+    const [previewVideo, setPreviewVideo] = useState(null);
+    const [previewError, setPreviewError] = useState('');
+    const [fallbackFailed, setFallbackFailed] = useState(false);
+
+    useEffect(() => {
+        if (!isOpen || !jobId || clipIndex === undefined) return;
+        const controller = new AbortController();
+        setPreviewVideo(null);
+        setPreviewError('');
+        setFallbackFailed(false);
+        apiJson(`/api/clip/${jobId}/${clipIndex}/subtitle-preview`, { signal: controller.signal })
+            .then(({ video_url }) => setPreviewVideo(getApiUrl(video_url)))
+            .catch((error) => {
+                if (!controller.signal.aborted) setPreviewError(error.detail || 'Could not load the editable video.');
+            });
+        return () => controller.abort();
+    }, [isOpen, jobId, clipIndex]);
 
     // Fetch word-level captions when modal opens
     useEffect(() => {
@@ -220,6 +238,8 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     };
 
     if (!isOpen) return null;
+    const resolvedVideo = jobId && clipIndex !== undefined ? previewVideo : videoUrl;
+    const loadingPreview = captionsLoading || (jobId && clipIndex !== undefined && !resolvedVideo && !previewError);
 
     // Build subtitle config for Remotion
     const subtitleConfig = {
@@ -281,21 +301,29 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             <div className="flex flex-col md:flex-row gap-6">
                 {/* Left: Preview */}
                 <div className="flex-1 flex flex-col items-center justify-center bg-black rounded-card border border-rule overflow-hidden relative aspect-[9/16] max-h-[600px]">
-                    {captionsLoading ? (
+                    {loadingPreview ? (
                         <div className="flex items-center gap-2 text-muted">
                             <Loader2 size={16} className="animate-spin" />
                             <span className="text-sm lowercase">Loading preview...</span>
                         </div>
-                    ) : useRemotionPreview ? (
+                    ) : previewError ? (
+                        <>
+                            {videoUrl && !fallbackFailed && <video src={videoUrl} controls playsInline
+                                onError={() => setFallbackFailed(true)} className="w-full h-full object-contain" />}
+                            <p role="status" className="absolute inset-x-3 top-3 rounded-input bg-black/80 p-2 text-center text-xs text-white">
+                                {previewError} {videoUrl && !fallbackFailed && 'Showing the saved clip.'}
+                            </p>
+                        </>
+                    ) : useRemotionPreview && resolvedVideo ? (
                         <RemotionPreview
-                            videoUrl={videoUrl}
+                            videoUrl={resolvedVideo}
                             durationInSeconds={durationSec}
                             subtitles={subtitleConfig}
                             hook={existingHook || null}
                         />
                     ) : (
                         <>
-                            <video src={videoUrl} className="w-full h-full object-contain opacity-50" muted playsInline />
+                            <video src={resolvedVideo} className="w-full h-full object-contain opacity-50" controls muted playsInline />
                             <div className={`absolute w-full px-8 text-center transition-all duration-300 pointer-events-none flex flex-col items-center justify-center
                                 ${position === 'top' ? 'top-20' : ''}
                                 ${position === 'middle' ? 'top-0 bottom-0' : ''}
@@ -371,7 +399,13 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
 
                         {/* Size */}
                         <div>
-                            <p className="eyebrow mb-2">Size</p>
+                            <label className="flex items-center justify-between gap-2 mb-2" htmlFor="subtitle-size">
+                                <span className="eyebrow">Subtitle size</span>
+                                <output className="readout" htmlFor="subtitle-size">{fontSize}</output>
+                            </label>
+                            <input id="subtitle-size" type="range" min={10} max={200} step={1}
+                                value={fontSize} onChange={(e) => setFontSize(e.target.valueAsNumber)}
+                                className="w-full accent-[var(--color-accent)] mb-2" />
                             <SegmentedControl
                                 options={SIZE_OPTIONS}
                                 value={fontSize}

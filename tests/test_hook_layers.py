@@ -5,6 +5,7 @@ The hook is a derived file (hooked_<ts>_<clean>) exactly like captions
 to the clean file instead of stacking a second overlay — the bug this design
 replaced. These tests pin the walk-back and the canonical-file resolution.
 """
+import asyncio
 import os
 import time
 
@@ -60,6 +61,60 @@ class TestLayerChain:
         no_captions = _strip_burned_captions(str(tmp_path), CAPTIONED_HOOKED)
         assert no_captions == HOOKED
         assert _strip_burned_hook(str(tmp_path), no_captions) == CLEAN
+
+    def test_watermarked_captioned_hook_uses_clean_preview_source(self, tmp_path):
+        marked = f"wm_{CAPTIONED_HOOKED}"
+        for name in (CLEAN, HOOKED, CAPTIONED_HOOKED, marked):
+            _touch(tmp_path, name)
+        assert app_module._hook_source(str(tmp_path), marked) == (CLEAN, True)
+
+    def test_watermark_alone_does_not_indicate_captions(self, tmp_path):
+        marked = f"wm_{CLEAN}"
+        _touch(tmp_path, CLEAN)
+        _touch(tmp_path, marked)
+        assert app_module._hook_source(str(tmp_path), marked) == (CLEAN, False)
+
+    def test_clip_title_starting_with_hook_is_not_a_burned_layer(self, tmp_path):
+        clean = "hook_intro_clip_1.mp4"
+        marked = f"wm_hooked_123_{clean}"
+        for name in (clean, f"hooked_123_{clean}", marked):
+            _touch(tmp_path, name)
+        assert app_module._hook_source(str(tmp_path), marked, canonical=clean) == (clean, False)
+
+    def test_local_subtitle_editor_streams_the_uncaptioned_hook_for_marked_clip(self, tmp_path, monkeypatch):
+        import httpx
+
+        job_id = "local-preview-test"
+        directory = tmp_path / job_id
+        directory.mkdir()
+        marked = f"wm_{CAPTIONED_HOOKED}"
+        for name in (CLEAN, CAPTIONED_HOOKED, marked, "base_metadata.json", ".marked"):
+            _touch(directory, name)
+        (directory / HOOKED).write_bytes(b"hooked-source")
+        monkeypatch.setattr(app_module, "OUTPUT_DIR", str(tmp_path))
+        monkeypatch.setattr(app_module, "BILLING_ENABLED", False)
+        monkeypatch.setenv("BILLING_ENABLED", "0")
+        monkeypatch.setenv("HIHUCLIP_WATERMARK", "1")
+        monkeypatch.setitem(app_module.jobs, job_id, {
+            "result": {"clips": [{"video_url": f"/videos/{job_id}/{marked}"}]},
+        })
+
+        async def preview():
+            transport = httpx.ASGITransport(app=app_module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                result = await client.get(f"/api/clip/{job_id}/0/subtitle-preview")
+                assert result.status_code == 200
+                url = result.json()["video_url"]
+                assert url.endswith("/editor-preview/video?layer=subtitles")
+                video = await client.get(url, headers={"Range": "bytes=0-5"})
+                assert video.status_code == 206
+                assert video.content == b"hooked"
+                assert not app_module._media_guard(f"{job_id}/{HOOKED}")
+
+                monkeypatch.setattr(app_module, "BILLING_ENABLED", True)
+                assert (await client.get(url)).status_code == 404
+
+        asyncio.run(preview())
 
 
 class TestHookedOnDemand:

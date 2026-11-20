@@ -3120,6 +3120,7 @@ if __name__ == '__main__':
             import watermarked
 
             hihuclip_watermark = watermarked.hihuclip_enabled()
+            hihuclip_label = watermarked.hihuclip_name() if hihuclip_watermark else None
 
             def _process_one_clip(i, clip):
                 if clip.get('pro_before'):
@@ -3200,7 +3201,7 @@ if __name__ == '__main__':
                                 style=cap_style)
                         served = captioned or deliver_path
                         if hihuclip_watermark:
-                            served = watermarked.mark_hihuclip_delivery(served)
+                            served = watermarked.mark_hihuclip_delivery(served, name=hihuclip_label)
                         elif os.environ.get("WATERMARK") == "1":
                             served = mark_delivery(served)
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")

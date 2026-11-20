@@ -87,8 +87,13 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // subtitled file (double-subtitle bug).
     const stripBurns = (filename) => {
         let f = filename || '', prev;
-        do { prev = f; f = f.replace(/^subtitled_\d+_/, '').replace(/^hooked_\d+_/, '').replace(/^hook_/, ''); } while (f !== prev);
-        return f;
+        do {
+            prev = f;
+            f = f.replace(/^wm_(?=subtitled_\d+_|hooked_\d+_|hook_)/, '')
+                .replace(/^subtitled_\d+_/, '');
+        } while (f !== prev);
+        if (/^hooked_\d+_/.test(f)) return f.replace(/^(?:hooked_\d+_)+/, '');
+        return clip.auto_hook ? f.replace(/^hook_/, '') : f;
     };
     const originalVideoUrl = getApiUrl((clip.video_url || '').replace(/[^/]+$/, stripBurns((clip.video_url || '').split('/').pop())));
     const [currentVideoUrl, setCurrentVideoUrl] = useState(getApiUrl(clip.video_url));
@@ -333,7 +338,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // The hook currently burned into the server file (auto-hook or a manual
     // one). /api/hook REPLACES it; tracked locally so the modal stays honest
     // after edits without refetching the job.
-    const [burnedHook, setBurnedHook] = useState(clip.auto_hook?.text || null);
+    const [burnedHook, setBurnedHook] = useState(clip.auto_hook?.text ? clip.auto_hook : null);
 
     // Fetch clip duration from transcript endpoint
     useEffect(() => {
@@ -475,7 +480,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    job_id: jobId, clip_index: index, input_filename: serverVideoFile,
+                    job_id: jobId, clip_index: index,
                 }),
             });
             if (!res.ok) throw new Error(await res.text());
@@ -555,7 +560,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     shadow: options.shadow || 0,
                     max_chars: options.maxChars ?? null,
                     max_duration: options.maxDuration ?? null,
-                    input_filename: serverVideoFile,
                     // Edited caption text (clip-relative ms); null = server
                     // regenerates from the transcript as before.
                     words: options.captions || null
@@ -633,7 +637,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     style: payload.style || 'pill',
                     font: payload.font || null,
                     duration_seconds: payload.remotion?.displayDurationSec ?? null,
-                    input_filename: serverVideoFile
+                    intro_blur: payload.remotion?.introBlur ?? false,
                 })
             });
 
@@ -642,7 +646,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
                 setServerVideoFile(data.new_video_url.split('/').pop());
-                setBurnedHook(data.burned_hook?.text ?? payload.text ?? null);
+                setBurnedHook(data.burned_hook ?? null);
                 if (videoRef.current) videoRef.current.load();
                 setShowHookModal(false);
             }
@@ -666,7 +670,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     job_id: jobId,
                     clip_index: index,
                     remove: true,
-                    input_filename: serverVideoFile,
                 }),
             });
             if (!res.ok) throw new Error(await res.text());
@@ -1327,26 +1330,30 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 bulkCount={clipCount}
                 bulkProgress={bulkProgress}
                 isProcessing={isSubtitling || (bulkProgress?.running ?? false)}
-                videoUrl={originalVideoUrl}
+                videoUrl={currentVideoUrl}
                 jobId={jobId}
                 clipIndex={index}
                 existingHook={activeLayers.hook}
+                savedFontSize={clip.caption_style?.font_size}
             />
 
-            <HookModal
+            {showHookModal && <HookModal
                 isOpen={showHookModal}
                 onClose={() => setShowHookModal(false)}
                 onGenerate={handleHook}
                 isProcessing={isHooking}
                 videoUrl={originalVideoUrl}
-                initialText={clip.viral_hook_text}
+                jobId={jobId}
+                clipIndex={index}
+                initialText={clip.viral_hook_text || clip.video_title_for_youtube_short}
+                existingHook={activeLayers.hook}
                 durationInSeconds={clip.end && clip.start ? clip.end - clip.start : 30}
                 existingSubtitles={activeLayers.subtitles}
                 hasCaptions={!!activeLayers.subtitles || /(^|_)subtitled_/.test(serverVideoFile || '')}
                 serverRender={hasServerBurns}
                 burnedHook={burnedHook}
                 onRemove={burnedHook ? handleRemoveHook : null}
-            />
+            />}
 
             <TranslateModal
                 isOpen={showTranslateModal}

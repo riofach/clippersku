@@ -1,8 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import RemotionPreview from './RemotionPreview';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
+import { getApiUrl } from '../config';
+import { apiJson } from '../lib/api';
+import { hookFontFaces, HOOK_FONTS } from '../remotion/lib/fonts';
 
 const ENTRANCE_OPTIONS = [
     { value: 'spring', label: 'Bounce' },
@@ -25,13 +28,14 @@ const HOOK_STYLES = [
 // Must mirror hooks.py HOOK_FONTS (all bundled: /fonts/*.ttf).
 const FONT_OPTIONS = [
     { value: 'montserrat', label: 'Montserrat' },
+    { value: 'archivo', label: 'Archivo Black' },
+    { value: 'barlow', label: 'Barlow Condensed' },
     { value: 'anton', label: 'Anton' },
     { value: 'serif', label: 'Serif' },
 ];
-const FONT_CSS = {
-    montserrat: { fontFamily: "'Montserrat-ExtraBold', 'Montserrat', sans-serif", fontWeight: 800 },
-    anton: { fontFamily: "'Anton-Regular', Impact, sans-serif", fontWeight: 400 },
-    serif: { fontFamily: "'Noto Serif', Georgia, serif", fontWeight: 700 },
+const fontStyle = (id) => {
+    const typeface = HOOK_FONTS[id] || HOOK_FONTS.serif;
+    return { fontFamily: typeface.family, fontWeight: typeface.weight };
 };
 // The style's own typeface when none is picked (what hooks.py renders).
 const styleFont = (st) => (st === 'pill' ? 'montserrat' : 'serif');
@@ -57,19 +61,34 @@ function loadHookPrefs() {
     try { return JSON.parse(localStorage.getItem('os_hook_prefs')) || {}; } catch { return {}; }
 }
 
-export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText, durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook }) {
-    const prefs = loadHookPrefs();
-    const [text, setText] = useState(initialText || 'POV: You are using the viral hook feature');
-    // Stored as `pos`, not `position`: before 'auto' existed every save wrote
-    // 'top' whether or not the user ever touched the control.
-    const [position, setPosition] = useState(prefs.pos || 'auto');
-    const [size, setSize] = useState(prefs.size || 'M');
-    const [style, setStyle] = useState(prefs.style || 'pill');
+export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText,
+    durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook, existingHook, jobId, clipIndex }) {
+    const [prefs] = useState(loadHookPrefs);
+    const saved = existingHook || burnedHook;
+    const [text, setText] = useState(saved?.text ?? initialText ?? '');
+    const [position, setPosition] = useState(saved?.position || prefs.pos || 'auto');
+    const [size, setSize] = useState(saved?.size || prefs.size || 'M');
+    const [style, setStyle] = useState(saved?.style || prefs.style || 'pill');
     // null = follow the style's own typeface.
-    const [font, setFont] = useState(prefs.font || null);
+    const [font, setFont] = useState(saved ? saved.font || null : prefs.font || null);
     const effectiveFont = font || styleFont(style);
-    const [entranceAnimation, setEntranceAnimation] = useState(prefs.entranceAnimation || 'spring');
-    const [displayDuration, setDisplayDuration] = useState(5);
+    const [entranceAnimation, setEntranceAnimation] = useState(saved?.entranceAnimation || prefs.entranceAnimation || 'none');
+    const [displayDuration, setDisplayDuration] = useState(saved?.displayDurationSec ?? saved?.duration_seconds ?? 5);
+    const [introBlur, setIntroBlur] = useState(saved?.introBlur ?? saved?.intro_blur ?? prefs.introBlur ?? true);
+    const [cleanPreview, setCleanPreview] = useState(null);
+    const [previewError, setPreviewError] = useState('');
+    const playerRef = useRef(null);
+
+    useEffect(() => {
+        if (!isOpen || !serverRender) return;
+        const controller = new AbortController();
+        apiJson(`/api/clip/${jobId}/${clipIndex}/hook-preview`, { signal: controller.signal })
+            .then(({ video_url }) => setCleanPreview(getApiUrl(video_url)))
+            .catch((error) => {
+                if (!controller.signal.aborted) setPreviewError(error.detail || 'Could not load the clean preview.');
+            });
+        return () => controller.abort();
+    }, [isOpen, serverRender, jobId, clipIndex]);
 
     if (!isOpen) return null;
 
@@ -80,67 +99,41 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
         size,
         style,
         font: effectiveFont,
-        entranceAnimation,
+        entranceAnimation: serverRender ? 'none' : entranceAnimation,
         displayDurationSec: displayDuration,
+        introBlur,
     };
+    const previewSource = serverRender ? cleanPreview : videoUrl;
 
-    const useRemotionPreview = !!videoUrl;
-
-    // Fallback preview logic (same as original)
-    const getPositionClass = () => {
-        switch (position) {
-            case 'center': return 'items-center justify-center';
-            case 'bottom': return 'items-center justify-end pb-[20%]';
-            case 'top': default: return 'items-center justify-start pt-[20%]';
-        }
+    const replayIntro = () => {
+        playerRef.current?.seekTo(0);
+        playerRef.current?.play();
     };
-
-    const getSizeStyle = () => {
-        switch (size) {
-            case 'S': return { fontSize: '14px', maxWidth: '80%' };
-            case 'L': return { fontSize: '24px', maxWidth: '95%' };
-            case 'M': default: return { fontSize: '18px', maxWidth: '90%' };
-        }
-    };
-
-    const pillFontFace = "@font-face{font-family:'Montserrat-ExtraBold';src:url('/fonts/Montserrat-ExtraBold.ttf') format('truetype');font-weight:800;}"
-        + "@font-face{font-family:'Anton-Regular';src:url('/fonts/Anton-Regular.ttf') format('truetype');font-weight:400;}";
 
     return (
         <Modal isOpen={isOpen} onClose={onClose} size="lg" eyebrow="EDITOR · HOOK" title="edit hook">
-            <style>{pillFontFace}</style>
+            <style>{hookFontFaces}</style>
             <div className="flex flex-col md:flex-row gap-6">
                 {/* Left: Preview */}
-                <div className="w-full max-w-[300px] mx-auto md:mx-0 md:w-[300px] shrink-0 self-start flex flex-col items-center justify-center bg-black rounded-card border border-rule overflow-hidden relative aspect-[9/16]">
-                    {useRemotionPreview ? (
-                        <RemotionPreview
-                            videoUrl={videoUrl}
-                            durationInSeconds={durationInSeconds || 30}
-                            hook={hookConfig}
-                            subtitles={existingSubtitles || null}
-                        />
-                    ) : (
-                        <>
-                            <video src={videoUrl} className="w-full h-full object-contain opacity-50" muted playsInline />
-                            <div className={`absolute w-full px-8 text-center transition-all duration-300 pointer-events-none flex flex-col h-full ${getPositionClass()}`}>
-                                <div
-                                    className="text-black font-bold px-3 py-2 rounded-xl shadow-2xl text-center whitespace-pre-wrap transition-all duration-200"
-                                    style={{
-                                        ...getSizeStyle(),
-                                        backgroundColor: 'rgba(255, 255, 255, 0.82)',
-                                        ...FONT_CSS[effectiveFont],
-                                        boxShadow: '0 4px 15px rgba(0,0,0,0.5)',
-                                        paddingTop: '10px',
-                                        paddingBottom: '10px',
-                                        paddingLeft: '12px',
-                                        paddingRight: '12px'
-                                    }}
-                                >
-                                    {text || "Enter your text..."}
-                                </div>
+                <div className="w-full max-w-[300px] mx-auto md:mx-0 md:w-[300px] shrink-0 self-start">
+                    <div className="bg-black rounded-card border border-rule overflow-hidden aspect-[9/16]">
+                        {previewSource ? (
+                            <RemotionPreview
+                                playerRef={playerRef}
+                                videoUrl={previewSource}
+                                durationInSeconds={durationInSeconds || 30}
+                                hook={hookConfig}
+                                subtitles={existingSubtitles || null}
+                            />
+                        ) : (
+                            <div role="status" className="flex h-full items-center justify-center p-4 text-center text-xs text-muted">
+                                {previewError || (serverRender ? 'Loading preview…' : 'Preview unavailable.')}
                             </div>
-                        </>
-                    )}
+                        )}
+                    </div>
+                    {previewSource && <button type="button" className="btn-quiet mt-2" onClick={replayIntro}>
+                        Replay intro
+                    </button>}
                 </div>
 
                 {/* Right: Controls */}
@@ -171,7 +164,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                         title={s.label}
                                     >
                                         {s.value === 'pill' ? (
-                                            <span className="flex flex-col items-center gap-0.5 py-0.5" style={FONT_CSS[font || styleFont(s.value)]}>
+                                            <span className="flex flex-col items-center gap-0.5 py-0.5" style={fontStyle(font || styleFont(s.value))}>
                                                 <span className="rounded-md px-1.5 text-[13px] leading-5 bg-white text-black">Aa Bb</span>
                                                 <span className="rounded-md px-1.5 text-[13px] leading-5 bg-white text-black">Cc</span>
                                             </span>
@@ -179,7 +172,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                             <span
                                                 className="block rounded-md px-1 py-1.5 text-[15px] leading-5"
                                                 style={{
-                                                    ...FONT_CSS[font || styleFont(s.value)],
+                                                    ...fontStyle(font || styleFont(s.value)),
                                                     backgroundColor: s.box,
                                                     color: s.text,
                                                     textShadow: s.outline ? '-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000' : 'none',
@@ -195,20 +188,31 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                         {/* Typeface */}
                         <div>
                             <p className="eyebrow mb-2">Font</p>
-                            <div className="grid grid-cols-3 gap-1.5">
+                            <div className="grid grid-cols-2 gap-1.5">
                                 {FONT_OPTIONS.map((f) => (
                                     <button
                                         key={f.value}
+                                        type="button"
+                                        aria-pressed={effectiveFont === f.value}
                                         onClick={() => setFont(f.value)}
                                         className={`px-1 py-2 rounded-input border text-[15px] text-ink transition-colors
                                             ${effectiveFont === f.value ? 'border-[color:var(--color-accent)]' : 'border-rule2 hover:border-[color:var(--color-accent)]'}`}
-                                        style={FONT_CSS[f.value]}
                                     >
-                                        {f.label}
+                                        <span aria-hidden="true" className="block text-lg leading-6" style={fontStyle(f.value)}>Aa</span>
+                                        <span className="block text-xs">{f.label}</span>
                                     </button>
                                 ))}
                             </div>
                         </div>
+
+                        <label className="flex items-start justify-between gap-3">
+                            <span>
+                                <span className="eyebrow block">Gaussian blur intro</span>
+                                <span className="mt-1 block text-xs text-muted">Blur for 2s, then fade to clear.</span>
+                            </span>
+                            <input type="checkbox" checked={introBlur} onChange={(e) => setIntroBlur(e.target.checked)}
+                                className="mt-0.5 h-4 w-4 accent-[var(--color-accent)]" />
+                        </label>
 
                         {/* Position Control */}
                         <div>
@@ -281,7 +285,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                         {burnedHook && (
                             <div className="p-3 border border-rule rounded-input text-xs text-muted space-y-2">
                                 <p>
-                                    This clip has a hook burned in ("{burnedHook}").
+                                    This clip has a hook burned in ("{burnedHook.text}").
                                     Generating replaces it with the new one.
                                 </p>
                                 {onRemove && (
@@ -309,7 +313,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                             onClick={() => {
                                 try {
                                     localStorage.setItem('os_hook_prefs', JSON.stringify({
-                                        style, font, pos: position, size, entranceAnimation,
+                                        style, font, pos: position, size, entranceAnimation, introBlur,
                                     }));
                                 } catch { /* ignore */ }
                                 onGenerate({

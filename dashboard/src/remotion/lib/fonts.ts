@@ -39,6 +39,25 @@ export const antonFontFace = `
 }
 `;
 
+const archivoFontFace = `
+@font-face {
+  font-family: 'Archivo Black';
+  src: url('${staticFile("fonts/ArchivoBlack-Regular.ttf")}') format('truetype');
+  font-weight: 400;
+}
+`;
+
+const barlowFontFace = `
+@font-face {
+  font-family: 'Barlow Condensed';
+  src: url('${staticFile("fonts/BarlowCondensed-Bold.ttf")}') format('truetype');
+  font-weight: 700;
+}
+`;
+
+export const hookFontFaces = notoSerifFontFace + montserratFontFace + antonFontFace
+  + archivoFontFace + barlowFontFace;
+
 /**
  * Hook typefaces: CSS family + share of the 90% box width used as font size.
  * Must mirror hooks.py HOOK_FONTS.
@@ -46,6 +65,8 @@ export const antonFontFace = `
 export const HOOK_FONTS: Record<string, { family: string; weight: number; factor: number }> = {
   montserrat: { family: `'${MONTSERRAT_FONT_FAMILY}', 'Montserrat', sans-serif`, weight: 800, factor: 0.064 },
   anton: { family: `'${ANTON_FONT_FAMILY}', Impact, sans-serif`, weight: 400, factor: 0.08 },
+  archivo: { family: "'Archivo Black', sans-serif", weight: 400, factor: 0.063 },
+  barlow: { family: "'Barlow Condensed', sans-serif", weight: 700, factor: 0.082 },
   serif: { family: `'${NOTO_SERIF_FONT_FAMILY}', 'Noto Serif', Georgia, serif`, weight: 700, factor: 0.05 },
 };
 

@@ -109,9 +109,8 @@ def scene_frame_ranges(scene_boundaries, strategies, total_frames):
 
 
 def concat_list_content(segment_paths):
-    # Single quotes per concat-demuxer spec; our paths are tempfile-generated
-    # (no quotes in them).
-    return "".join(f"file '{p}'\n" for p in segment_paths)
+    paths = (os.fspath(p).replace("'", "'\\''") for p in segment_paths)
+    return "".join(f"file '{path}'\n" for path in paths)
 
 
 # How much of the frame height the real content should fill in GENERAL layout.
@@ -639,8 +638,9 @@ def encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
             segments.append(seg_path)
 
         list_path = os.path.join(workdir, "concat.txt")
-        with open(list_path, "w") as f:
-            f.write(concat_list_content(segments))
+        # Cached segments live outside the concat list's temporary directory.
+        with open(list_path, "w", encoding="utf-8") as f:
+            f.write(concat_list_content(os.path.abspath(path) for path in segments))
         video_in = ["-f", "concat", "-safe", "0", "-i", list_path]
 
     # Video (stream copy) + audio straight from the clip.
@@ -848,6 +848,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         print(f"   📹 Camera-inset layout on {inset_count} scene(s)")
 
     preset_boxes = {}
+    gameplay_percents = {}
     overrides = crop_overrides or {}
     if layout_preset in preset_layout.PRESETS:
         if not force_strategy and not passthrough:
@@ -865,14 +866,15 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         if preset_boxes:
             print(f"   🖼️ {layout_preset.upper()} preset on {len(preset_boxes)} scene(s)")
 
-    # A manual grid is a choice for this scene, even on a project that was
-    # generated with a different upload preset.
+    # Manual layouts can differ from the project's upload preset.
     for i, value in overrides.items():
         if (0 <= i < len(scenes) and isinstance(value, dict)
-                and value.get("layout") in preset_layout.PRESETS):
+                and value.get("layout") in preset_layout.MANUAL_LAYOUTS):
             start_f = scene_boundaries[i][0]
             strategies[i] = value["layout"].upper()
             preset_boxes[start_f] = preset_layout.pixels(value["boxes"], orig_w, orig_h)
+            if "gameplay_percent" in value:
+                gameplay_percents[start_f] = value["gameplay_percent"]
             alternates.pop(start_f, None)
             focus_crops.pop(start_f, None)
 
@@ -937,9 +939,10 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
             dur = (end_f - start_f) / fps
             boxes = None
 
-            if strategy in ('GAMING', 'PANEL'):
+            if start_f in preset_boxes:
                 graph = preset_layout.filtergraph(
-                    strategy.lower(), preset_boxes[start_f], orig_w, orig_h, out_w, out_h)
+                    strategy.lower(), preset_boxes[start_f], orig_w, orig_h, out_w, out_h,
+                    gameplay_percent=gameplay_percents.get(start_f, preset_layout.DEFAULT_GAMEPLAY_PERCENT))
             elif strategy == 'INSET':
                 graph = camera_inset.inset_filtergraph(
                     orig_w, orig_h, out_w, out_h, insets.get(start_f, inset))
@@ -960,6 +963,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 left, right = splits[start_f]
                 graph = split_layout.split_filtergraph(
                     orig_w, orig_h, out_w, out_h, left, right)
+                preset_boxes[start_f] = preset_layout.split_boxes(
+                    orig_w, orig_h, out_w, out_h, (left, right))
             elif strategy == 'GENERAL':
                 graph = general_filtergraph(out_w, out_h,
                                             orig_w=orig_w, orig_h=orig_h)
@@ -1005,7 +1010,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     layout_ranges.write(final_output_video,
                         [(s / fps, e / fps, strategy, bands.get(s),
                           preset_layout.fractions(preset_boxes[s], orig_w, orig_h)
-                          if strategy in ('GAMING', 'PANEL') else None)
+                          if s in preset_boxes else None)
                          for s, e, strategy in ranges])
     print(f"   ✅ Clip saved to {final_output_video}")
     return True

@@ -56,15 +56,16 @@ export type HookStyle =
   | "outline"
   | "outline_yellow";
 
-export type HookFont = "montserrat" | "anton" | "serif";
+export type HookFont = "montserrat" | "anton" | "archivo" | "barlow" | "serif";
 
 export interface HookConfig {
   text: string;
   position: HookPosition;
   size: HookSize;
   style?: HookStyle;
-  /** montserrat | anton | serif; unset = the style's own typeface. */
+  /** Unset follows the style's own typeface. */
   font?: HookFont;
+  introBlur?: boolean;
   entranceAnimation: HookEntrance;
   displayDurationSec: number;
 }

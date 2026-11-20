@@ -3,17 +3,26 @@ import math
 
 import camera_inset
 import panel_layout
+import split_layout
 
 GAMING = "gaming"
 PANEL = "panel"
+SPLIT = "split"
 PRESETS = (GAMING, PANEL)
+MANUAL_LAYOUTS = (*PRESETS, SPLIT)
+DEFAULT_GAMEPLAY_PERCENT = 60
 
 
-def panel_sizes(preset, width, height):
+def panel_sizes(preset, width, height, *, count=4, gameplay_percent=DEFAULT_GAMEPLAY_PERCENT):
     if preset == GAMING:
-        top = 2 * round(height * 0.30)
+        top = 2 * math.floor(height * gameplay_percent / 200 + .5)
         return [(width, top), (width, height - top)]
+    if preset == SPLIT:
+        half_h = height // 2
+        return [(width, half_h - half_h % 2)] * 2
     _, _, tile_w, tile_h = panel_layout.tile_grid(4, width, height)
+    if count == 3:
+        return [(tile_w, tile_h)] * 2 + [(width, height - tile_h)]
     return [(tile_w, tile_h)] * 4
 
 
@@ -36,9 +45,9 @@ def validate_override(value):
     """Validate a manually placed set of source rectangles."""
     preset = value["layout"]
     boxes = value["boxes"]
-    if preset not in PRESETS or not isinstance(boxes, list):
+    if preset not in MANUAL_LAYOUTS or not isinstance(boxes, list):
         raise ValueError("Invalid layout preset")
-    if len(boxes) != (2 if preset == GAMING else 4):
+    if len(boxes) not in ((3, 4) if preset == PANEL else (2,)):
         raise ValueError("Wrong number of crop boxes")
     normalized = []
     for i, box in enumerate(boxes):
@@ -53,12 +62,23 @@ def validate_override(value):
                 or x + w > 1.00001 or y + h > 1.00001):
             raise ValueError("Crop box must fit inside the source")
         normalized.append([x, y, min(w, 1 - x), min(h, 1 - y)])
-    return {"layout": preset, "boxes": normalized}
+    result = {"layout": preset, "boxes": normalized}
+    if preset == GAMING and "gameplay_percent" in value:
+        percent = value["gameplay_percent"]
+        if type(percent) is not int or not 40 <= percent <= 80:
+            raise ValueError("Gameplay height must be between 40% and 80%")
+        result["gameplay_percent"] = percent
+    return result
 
 
 def pixels(boxes, width, height):
     return [(box[2] * width, box[3] * height, box[0] * width, box[1] * height)
             if box is not None else None for box in boxes]
+
+
+def split_boxes(width, height, out_w, out_h, centres):
+    return [split_layout.split_geometry(width, height, out_w, out_h, centre)[:4]
+            for centre in centres]
 
 
 def initial_boxes(preset, width, height, out_w, out_h):
@@ -67,8 +87,9 @@ def initial_boxes(preset, width, height, out_w, out_h):
     if preset == GAMING:
         return gaming_boxes(width, height, sizes,
                             (.32 * width, .36 * height, .68 * width, .64 * height))
-    centres = [(width * x, height * y) for y in (.33, .66) for x in (.25, .75)]
-    return panel_layout.panel_boxes(width, height, *sizes[0], centres)
+    half_w, half_h = width / 2, height / 2
+    return [cover_box((half_w, half_h, x, y), sizes[0])
+            for y in (0, half_h) for x in (0, half_w)]
 
 
 def gaming_boxes(width, height, sizes, inset):
@@ -100,8 +121,9 @@ def automatic(preset, path, scenes, strategies, bounds, width, height, out_w, ou
     return detected
 
 
-def filtergraph(preset, boxes, orig_w, orig_h, out_w, out_h):
-    sizes = panel_sizes(preset, out_w, out_h)
+def filtergraph(preset, boxes, orig_w, orig_h, out_w, out_h, *,
+                gameplay_percent=DEFAULT_GAMEPLAY_PERCENT):
+    sizes = panel_sizes(preset, out_w, out_h, count=len(boxes), gameplay_percent=gameplay_percent)
     inputs = "".join(f"[s{i}]" for i in range(len(sizes)))
     parts = [f"[0:v]split={len(sizes)}{inputs};"]
     for i, (box, (out_x, out_y)) in enumerate(zip(boxes, sizes)):
@@ -116,9 +138,14 @@ def filtergraph(preset, boxes, orig_w, orig_h, out_w, out_h):
         x = max(0, min((orig_w - w) // 2, round(x / 2)) * 2)
         y = max(0, min((orig_h - h) // 2, round(y / 2)) * 2)
         parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},scale={out_x}:{out_y},setsar=1[t{i}];")
-    if preset == PANEL:
+    if preset == PANEL and len(boxes) == 3:
+        parts += [f"[t0][t1]hstack,pad={out_w}:{sizes[0][1]}:0:0[top];",
+                  "[top][t2]vstack[v]"]
+    elif preset == PANEL:
         parts += ["[t0][t1]hstack[top];", "[t2][t3]hstack[bottom];",
                   f"[top][bottom]vstack,pad={out_w}:{out_h}:0:0[v]"]
+    elif preset == SPLIT:
+        parts.append(f"[t0][t1]vstack,pad={out_w}:{out_h}:0:0[v]")
     else:
         parts.append("[t0][t1]vstack[v]")
     return "".join(parts)

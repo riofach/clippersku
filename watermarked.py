@@ -22,12 +22,21 @@ found the mark still there on every download and every restyle.
 The self-hosted HihuClip instance also uses the delivery-copy convention
 so edits can start from a clean master.
 """
+import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+from pathlib import Path
+
+from jsonfile import write_json_atomic
 
 PREFIX = "wm_"
+DEFAULT_NAME = "@HihuClip"
+MAX_NAME_LENGTH = 40
+SETTINGS_FILE = ".hihuclip-watermark.json"
+_NAME_TAG = "hihuclip_watermark"
 
 
 def hihuclip_enabled() -> bool:
@@ -35,31 +44,73 @@ def hihuclip_enabled() -> bool:
             and os.getenv("BILLING_ENABLED", "").lower() not in ("1", "true", "yes"))
 
 
-def mark_hihuclip_delivery(path: str) -> str:
+def validate_hihuclip_name(value):
+    value = value.strip()
+    if not 1 <= len(value) <= MAX_NAME_LENGTH or not value.isprintable():
+        raise ValueError(f"Enter a watermark name of 1–{MAX_NAME_LENGTH} printable characters.")
+    return value
+
+
+def hihuclip_name(output_root="output"):
+    try:
+        path = Path(output_root) / SETTINGS_FILE
+        return validate_hihuclip_name(json.loads(path.read_text(encoding="utf-8"))["name"])
+    except (OSError, KeyError, TypeError, AttributeError, ValueError):
+        return DEFAULT_NAME
+
+
+def save_hihuclip_name(output_root, name):
+    name = validate_hihuclip_name(name)
+    write_json_atomic(Path(output_root) / SETTINGS_FILE, {"name": name})
+    return name
+
+
+def _name_in_video(path):
+    try:
+        raw = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", f"format_tags={_NAME_TAG}",
+             "-of", "json", path], timeout=15,
+        )
+        tags = json.loads(raw).get("format", {}).get("tags", {})
+        return tags.get(_NAME_TAG, DEFAULT_NAME)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def mark_hihuclip_delivery(path: str, *, name=None) -> str:
     """Burn the brand into the delivered MP4, preserving the editable input."""
     from ffmpeg_utils import QUALITY_FAST, video_encode_args
 
+    name = hihuclip_name() if name is None else validate_hihuclip_name(name)
     path = os.path.abspath(path)
     directory = os.path.dirname(path)
     marked_path = os.path.join(directory, marked_name(path))
     if os.path.isfile(marked_path) and os.path.getsize(marked_path) > 0:
-        if os.path.getmtime(marked_path) >= os.path.getmtime(path):
+        if os.path.getmtime(marked_path) >= os.path.getmtime(path) and _name_in_video(marked_path) == name:
             return marked_path
 
-    drawtext = ("drawtext=fontfile=fonts/Montserrat-ExtraBold.ttf:text=@HihuClip:"
-                "fontsize=w/29:x=w*0.055:y=h*0.13:"
+    # Keep user text out of the filter expression. A relative textfile also
+    # avoids platform-specific path escaping inside FFmpeg filters.
+    font_divisor = max(29, len(name))
+    drawtext = ("drawtext=fontfile=watermark.ttf:textfile=watermark.txt:expansion=none:"
+                f"fontsize=w/{font_divisor}:x=w*0.055:y=h*0.13:"
                 "fontcolor=white@0.9:borderw=2:bordercolor=black@0.65")
     fd, temporary_path = tempfile.mkstemp(prefix=".hihuclip-", suffix=".mp4", dir=directory)
     os.close(fd)
     try:
-        result = subprocess.run(
-            ["ffmpeg", "-v", "error", "-y", "-i", path,
-             "-map", "0:v:0", "-map", "0:a?", "-vf", drawtext,
-             *video_encode_args(QUALITY_FAST), "-c:a", "copy",
-             "-movflags", "+faststart+use_metadata_tags", temporary_path],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, errors="replace", timeout=1800,
-        )
+        with tempfile.TemporaryDirectory(prefix="hihuclip-text-") as working_dir:
+            working_dir = Path(working_dir)
+            font = Path(__file__).resolve().parent / "fonts" / "Montserrat-ExtraBold.ttf"
+            shutil.copyfile(font, working_dir / "watermark.ttf")
+            (working_dir / "watermark.txt").write_text(name, encoding="utf-8")
+            result = subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", path,
+                 "-map", "0:v:0", "-map", "0:a?", "-vf", drawtext,
+                 *video_encode_args(QUALITY_FAST), "-c:a", "copy",
+                 "-metadata", f"{_NAME_TAG}={name}",
+                 "-movflags", "+faststart+use_metadata_tags", temporary_path],
+                cwd=working_dir, capture_output=True, text=True, errors="replace", timeout=1800,
+            )
         if result.returncode or not os.path.getsize(temporary_path):
             raise RuntimeError(f"HihuClip watermark failed: {result.stderr.strip()[-500:]}")
         os.replace(temporary_path, marked_path)

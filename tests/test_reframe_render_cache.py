@@ -1,3 +1,4 @@
+from pathlib import Path
 import shutil
 import subprocess
 
@@ -10,6 +11,7 @@ from reframe_render_cache import ReframeRenderCache
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
                     reason="requires FFmpeg")
 def test_changed_scene_is_encoded_and_unchanged_video_is_reused(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     source = tmp_path / "source.mp4"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
                     "color=c=red:s=160x90:r=10:d=3",
@@ -27,7 +29,7 @@ def test_changed_scene_is_encoded_and_unchanged_video_is_reused(tmp_path, monkey
     normal = "[0:v]crop=48:84:56:2,scale=90:160,setsar=1[v]"
     moved = "[0:v]crop=48:84:84:2,scale=90:160,setsar=1[v]"
     for n, graph in enumerate((normal, moved)):
-        cache = ReframeRenderCache(tmp_path, 0, ["same-source", 0, 3])
+        cache = ReframeRenderCache(Path("."), 0, ["same-source", 0, 3])
         assert cache.prepare()
         work = tmp_path / f"work{n}"
         work.mkdir()

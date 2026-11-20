@@ -15,10 +15,47 @@ render (``cloud.videos.unmark_user_library``).
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 
 import pytest
 
 import watermarked
+
+
+def test_local_watermark_settings_are_persisted_and_validated(tmp_path, monkeypatch):
+    app = pytest.importorskip("app")
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "BILLING_ENABLED", False)
+    monkeypatch.setenv("BILLING_ENABLED", "0")
+    monkeypatch.setenv("HIHUCLIP_WATERMARK", "1")
+    assert asyncio.run(app.get_watermark_settings())["name"] == "@HihuClip"
+    settings = app.WatermarkSettingsRequest(name=" @Brand Baru ")
+    assert asyncio.run(app.save_watermark_settings(settings))["name"] == "@Brand Baru"
+    assert watermarked.hihuclip_name(tmp_path) == "@Brand Baru"
+    with pytest.raises(app.HTTPException) as error:
+        asyncio.run(app.save_watermark_settings(app.WatermarkSettingsRequest(name=" " * 3)))
+    assert error.value.status_code == 422
+    assert watermarked.hihuclip_name(tmp_path) == "@Brand Baru"
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="requires FFmpeg")
+def test_export_replaces_cached_watermark_when_name_changes(tmp_path):
+    source = tmp_path / "clip.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=black:s=320x560:r=4:d=1",
+        "-c:v", "libx264", str(source),
+    ], check=True, timeout=30)
+    marked = watermarked.mark_hihuclip_delivery(str(source), name="@HihuClip")
+    initial = os.stat(marked).st_mtime_ns
+    assert watermarked.mark_hihuclip_delivery(str(source), name="@HihuClip") == marked
+    assert os.stat(marked).st_mtime_ns == initial
+
+    name = "Día: 100% [Brand's]"
+    assert watermarked.mark_hihuclip_delivery(str(source), name=name) == marked
+    assert watermarked._name_in_video(marked) == name
+    assert os.stat(marked).st_mtime_ns != initial
 
 
 class TestNames:

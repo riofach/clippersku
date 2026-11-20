@@ -36,8 +36,15 @@ PILL_FONT_PATH = os.path.join(FONT_DIR, "Montserrat-ExtraBold.ttf")
 HOOK_FONTS = {
     "montserrat": (PILL_FONT_PATH, 0.064),
     "anton": (os.path.join(FONT_DIR, "Anton-Regular.ttf"), 0.08),
+    "archivo": (os.path.join(FONT_DIR, "ArchivoBlack-Regular.ttf"), 0.063),
+    "barlow": (os.path.join(FONT_DIR, "BarlowCondensed-Bold.ttf"), 0.082),
     "serif": (FONT_PATH, 0.05),
 }
+
+INTRO_BLUR_SECONDS = 2
+INTRO_FADE_SECONDS = 0.5
+INTRO_BLUR_SIGMA_RATIO = 0.018
+HOOK_SIZE_SCALES = {"S": 0.8, "M": 1.0, "L": 1.3}
 
 # Codepoint ranges NotoSerif has no glyphs for (would render as tofu boxes).
 _EMOJI_RE = re.compile(
@@ -484,7 +491,7 @@ def _auto_place(video_path, text, target_box_width, hook_filename, font_scale, s
 
 def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0, duration=None, style="pill",
                       also=None, font=None, layout_ranges=None, has_captions=True,
-                      mark=None):
+                      mark=None, intro_blur=False):
     """
     Overlays text hook onto video.
     position: 'top', 'center', 'bottom', or 'auto' (hook_placement: off the
@@ -496,6 +503,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
       the clip's own ``.layout.json`` sidecar.
     font_scale: float multiplier (1.0 = default)
     style: hook look (see HOOK_STYLES)
+    intro_blur: blur the source for two seconds, then fade it out below the title.
     also: optional (vf, path): ALSO write ``path`` = the hooked picture with
       ``vf`` applied (the captions), from the same decode. The editor
       re-captions from the hooked-only picture, but most clips are never
@@ -568,7 +576,8 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         # 4. FFmpeg Command
         print(f"🎬 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")
         
-        overlay = _overlay_graph(overlay_x, overlay_y, duration)
+        blur_sigma = min(64, video_width * INTRO_BLUR_SIGMA_RATIO) if intro_blur else 0
+        overlay = _overlay_graph(overlay_x, overlay_y, duration, blur_sigma)
         tail = _encode_tail()
         lazy = also is not None and LAZY
         hooked_out = [] if lazy else ['-map', '[h]', '-map', '0:a?', *tail, output_path]
@@ -615,7 +624,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
                                                 result.stdout, result.stderr)
         if lazy:
             try:
-                _write_recipe(output_path, video_path, img_path, overlay_x, overlay_y, duration)
+                _write_recipe(output_path, video_path, img_path, overlay_x, overlay_y, duration, blur_sigma)
                 print(f"✅ Hook added to {also[1]} ({os.path.basename(output_path)} on demand)")
             except Exception as e:
                 # No recipe, no on-demand file: encode the hooked picture now.
@@ -653,8 +662,17 @@ LAZY = os.environ.get("HOOK_LAZY", "1").strip() != "0"
 RECIPE_PREFIX = ".hookrecipe_"
 
 
-def _overlay_graph(x, y, duration):
-    return (f"[0:v][1:v]overlay={x}:{y}"
+def _overlay_graph(x, y, duration, blur_sigma=0):
+    background = "[0:v]"
+    if blur_sigma:
+        fade_end = INTRO_BLUR_SECONDS + INTRO_FADE_SECONDS
+        background = (
+            "[0:v]split[clear][intro];"
+            f"[intro]trim=end={fade_end},gblur=sigma={blur_sigma:.3f},format=yuva420p,"
+            f"fade=t=out:st={INTRO_BLUR_SECONDS}:d={INTRO_FADE_SECONDS}:alpha=1[blur];"
+            "[clear][blur]overlay=eof_action=pass:repeatlast=0[base];[base]"
+        )
+    return (f"{background}[1:v]overlay={x}:{y}"
             + (f":enable='between(t,0,{float(duration)})'" if duration else ""))
 
 
@@ -687,7 +705,7 @@ def has_recipe(output_dir, hooked_name):
     return os.path.exists(recipe_paths(output_dir, hooked_name)[0])
 
 
-def _write_recipe(output_path, video_path, img_path, x, y, duration):
+def _write_recipe(output_path, video_path, img_path, x, y, duration, blur_sigma=0):
     """Keep what it takes to encode ``output_path`` later: the overlay image
     and where it went. The source must sit in the same directory."""
     output_dir = os.path.dirname(output_path)
@@ -697,7 +715,7 @@ def _write_recipe(output_path, video_path, img_path, x, y, duration):
     shutil.copyfile(img_path, png_path)
     with open(json_path, "w") as f:
         json.dump({"source": os.path.basename(video_path), "x": x, "y": y,
-                   "duration": duration}, f)
+                   "duration": duration, "blur_sigma": blur_sigma}, f)
 
 
 def materialize(output_dir, hooked_name):
@@ -722,13 +740,14 @@ def materialize(output_dir, hooked_name):
     try:
         x, y = int(r["x"]), int(r["y"])
         duration = float(r["duration"]) if r.get("duration") else None
+        blur_sigma = float(r.get("blur_sigma", 0))
     except (KeyError, TypeError, ValueError):
         return False
-    if not (-20000 <= x <= 20000 and -20000 <= y <= 20000) or (
+    if not (-20000 <= x <= 20000 and -20000 <= y <= 20000 and 0 <= blur_sigma <= 64) or (
             duration is not None and not 0 < duration < 86400):
         return False
     tmp = os.path.join(output_dir, f".part_{uuid.uuid4().hex[:8]}_{hooked_name}")
-    cmd = _overlay_cmd(source, png_path, _overlay_graph(x, y, duration), tmp)
+    cmd = _overlay_cmd(source, png_path, _overlay_graph(x, y, duration, blur_sigma), tmp)
     try:
         result = _run_encode(cmd, source, [tmp])
         if result.returncode != 0 and not finished_before_crash(result, [tmp]):

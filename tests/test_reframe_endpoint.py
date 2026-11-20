@@ -178,17 +178,22 @@ class TestReframeRender:
         assert fake_recut[0]["scene_ranges"] == [(0, 15), (15, 30)]
         assert _request("POST", "/api/clip/reframe", {**req, "scene_key": "old"}).status_code == 409
 
-    def test_preset_boxes_round_trip_and_reset(self, job, fake_recut):
+    @pytest.mark.parametrize("override", [
+        {"layout": "gaming", "boxes": [[.1, 0, .5, .9], [.75, .65, .2, .25]]},
+        {"layout": "gaming", "boxes": [[.1, 0, .5, .9], [.75, .65, .2, .25]], "gameplay_percent": 70},
+        {"layout": "panel", "boxes": [[.1, 0, .2, .4], [.6, 0, .2, .4], [.1, .5, .7, .4]]},
+        {"layout": "split", "boxes": [[.1, 0, .5, .9], [.3, .1, .5, .8]]},
+    ])
+    def test_preset_boxes_round_trip_and_reset(self, job, fake_recut, override):
         meta = json.loads(job["meta_path"].read_text())
         meta["layout_preset"] = "gaming"
         job["meta_path"].write_text(json.dumps(meta))
-        boxes = {"layout": "gaming", "boxes": [[.1, 0, .5, .9], [.75, .65, .2, .25]]}
-        req = {"job_id": JOB_ID, "clip_index": 0, "crop_overrides": {"0": boxes}}
+        req = {"job_id": JOB_ID, "clip_index": 0, "crop_overrides": {"0": override}}
         assert _request("POST", "/api/clip/reframe", req).status_code == 200
         assert fake_recut[0]["layout_preset"] == "gaming"
-        assert fake_recut[0]["crop_overrides"][0] == boxes
+        assert fake_recut[0]["crop_overrides"][0] == override
         saved = json.loads(job["meta_path"].read_text())["shorts"][0]
-        assert saved["crop_overrides"] == {"0": boxes}
+        assert saved["crop_overrides"] == {"0": override}
         req.update(crop_overrides={}, reset_automatic=True)
         assert _request("POST", "/api/clip/reframe", req).status_code == 200
         assert fake_recut[1]["crop_overrides"] == {}

@@ -3,6 +3,7 @@ import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activ
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
+import WatermarkSettings from './components/WatermarkSettings';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
 import { clipProgress, FREE_CLIPS_PER_VIDEO, FREE_CLIPS_QUIET, MAX_CLIPS_PER_VIDEO } from './lib/clipProgress';
@@ -1826,6 +1827,7 @@ function App() {
               {/* Self-hosted installs have no account page, so the agent
                   how-to lives here; cloud users get it (with OAuth) in Account. */}
               {!billingEnabled && <div className="mb-6"><McpConnectCard cloud={false} /></div>}
+              {!billingEnabled && <WatermarkSettings />}
               {isManaged ? (
                 <div className="card p-6 mb-2">
                   <div className="flex items-center justify-between mb-3">

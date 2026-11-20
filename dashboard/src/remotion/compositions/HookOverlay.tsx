@@ -8,12 +8,7 @@ import {
   interpolate,
 } from "remotion";
 import type { HookConfig } from "../lib/types";
-import {
-  notoSerifFontFace,
-  montserratFontFace,
-  antonFontFace,
-  HOOK_FONTS,
-} from "../lib/fonts";
+import { hookFontFaces, HOOK_FONTS } from "../lib/fonts";
 
 interface HookOverlayProps {
   config: HookConfig;
@@ -59,7 +54,7 @@ export const HookOverlay: React.FC<HookOverlayProps> = ({ config }) => {
 
   return (
     <AbsoluteFill>
-      <style>{notoSerifFontFace + montserratFontFace + antonFontFace}</style>
+      <style>{hookFontFaces}</style>
       <Sequence from={0} durationInFrames={displayFrames} layout="none">
         <HookBox config={config} displayFrames={displayFrames} />
       </Sequence>

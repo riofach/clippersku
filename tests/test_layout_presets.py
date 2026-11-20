@@ -7,19 +7,28 @@ import layout_ranges
 import preset_layout as presets
 
 
-@pytest.mark.parametrize("preset,source,boxes,samples", [
-    ("gaming", "color=red:s=160x90:d=1,drawbox=x=120:y=60:w=40:h=30:c=blue:t=fill",
-     [(80, 90, 40, 0), (40, 30, 120, 60)],
-     [(80, 167, 0), (80, 168, 2)]),
-    ("panel", "color=red:s=160x90:d=1,drawbox=x=80:y=0:w=80:h=44:c=lime:t=fill,"
-              "drawbox=x=0:y=44:w=80:h=46:c=blue:t=fill,"
-              "drawbox=x=80:y=44:w=80:h=46:c=white:t=fill",
+TWO_COLORS = "color=red:s=160x90:d=1,drawbox=x=120:y=60:w=40:h=30:c=blue:t=fill"
+FOUR_COLORS = ("color=red:s=160x90:d=1,drawbox=x=80:y=0:w=80:h=44:c=lime:t=fill,"
+               "drawbox=x=0:y=44:w=80:h=46:c=blue:t=fill,"
+               "drawbox=x=80:y=44:w=80:h=46:c=white:t=fill")
+
+
+@pytest.mark.parametrize("preset,source,boxes,samples,settings", [
+    ("gaming", TWO_COLORS, [(80, 90, 40, 0), (40, 30, 120, 60)],
+     [(80, 167, 0), (80, 168, 2)], {}),
+    ("gaming", TWO_COLORS, [(80, 90, 40, 0), (40, 30, 120, 60)],
+     [(80, 195, 0), (80, 196, 2)], {"gameplay_percent": 70}),
+    ("panel", FOUR_COLORS,
      [(48, 42, 16, 0), (48, 42, 96, 0), (48, 44, 16, 44), (48, 44, 96, 44)],
-     [(40, 70, 0), (120, 70, 1), (40, 210, 2), (120, 210, 0)]),
+     [(40, 70, 0), (120, 70, 1), (40, 210, 2), (120, 210, 0)], {}),
+    ("panel", FOUR_COLORS, [(48, 42, 16, 0), (48, 42, 96, 0), (80, 44, 0, 44)],
+     [(40, 70, 0), (120, 70, 1), (40, 210, 2), (120, 210, 2)], {}),
+    ("split", TWO_COLORS, [(80, 90, 40, 0), (40, 30, 120, 60)],
+     [(80, 139, 0), (80, 140, 2)], {}),
 ])
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs FFmpeg")
-def test_filtergraph_renders_expected_panel_pixels(preset, source, boxes, samples):
-    graph = presets.filtergraph(preset, boxes, 160, 90, 160, 280)
+def test_filtergraph_renders_expected_panel_pixels(preset, source, boxes, samples, settings):
+    graph = presets.filtergraph(preset, boxes, 160, 90, 160, 280, **settings)
     rgb = subprocess.check_output(
         ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", source,
          "-filter_complex", graph, "-map", "[v]", "-frames:v", "1",
@@ -29,8 +38,9 @@ def test_filtergraph_renders_expected_panel_pixels(preset, source, boxes, sample
         i = (y * 160 + x) * 3
         assert rgb[i + channel] > 215
     if preset == "gaming":
-        assert rgb[(167 * 160 + 80) * 3 + 2] < 30
-        assert rgb[(168 * 160 + 80) * 3] < 30
+        boundary = samples[1][1]
+        assert rgb[((boundary - 1) * 160 + 80) * 3 + 2] < 30
+        assert rgb[(boundary * 160 + 80) * 3] < 30
 
 
 def test_facecam_uses_manual_crop_when_missing_and_only_splits_visible_scenes(monkeypatch):
@@ -59,6 +69,15 @@ def test_panel_supports_a_wide_tile_and_preserves_boxes_in_metadata(tmp_path, mo
     layout_ranges.write(path, [(0, 3, "PANEL", None, boxes)])
     assert layout_ranges.remap(layout_ranges.read(path), [{"start": 1, "end": 3}]) == [
         {"start": 0, "end": 2, "layout": "panel", "boxes": boxes}]
+
+
+def test_manual_grid_starts_with_one_crop_in_each_source_quadrant():
+    width, height = 1920, 1080
+    boxes = presets.initial_boxes("panel", width, height, 1080, 1920)
+    for i, (w, h, x, y) in enumerate(boxes):
+        col, row = i % 2, i // 2
+        assert col * width / 2 <= x < x + w <= (col + 1) * width / 2
+        assert row * height / 2 <= y < y + h <= (row + 1) * height / 2
 
 
 @pytest.mark.parametrize("boxes", [

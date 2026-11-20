@@ -61,46 +61,8 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
     const half = (data?.crop_width_fraction ?? 0.5) / 2;
     const clamp = useCallback((v) => Math.min(1 - half, Math.max(half, v)), [half]);
 
-    // What a scene shows right now: the user's value, else the backend's
-    // suggestion (the biggest face in the shot).
-    const valueOf = useCallback((scene) => (
-        overrides[scene.index] ?? clamp(scene.suggested_center)
-    ), [overrides, clamp]);
-
     const setSingle = useCallback((idx, fraction) => {
         setOverrides((o) => ({ ...o, [idx]: clamp(fraction) }));
-    }, [clamp]);
-
-    const setSplitHalf = useCallback((idx, which, fraction) => {
-        setOverrides((o) => {
-            const cur = o[idx];
-            const base = (cur && typeof cur === 'object')
-                ? cur
-                : { top: { x: clamp(0.3), y: 0.5 }, bottom: { x: clamp(0.7), y: 0.5 } };
-            const anterior = base[which] || { y: 0.5 };
-            return { ...o, [idx]: {
-                ...base,
-                [which]: { x: clamp(fraction), y: anterior.y ?? 0.5 },
-            } };
-        });
-    }, [clamp]);
-
-    const toggleSplit = useCallback((idx, scene) => {
-        setOverrides((o) => {
-            const cur = o[idx];
-            if (cur && typeof cur === 'object') {
-                // back to a single window, kept where the top half was
-                return { ...o, [idx]: cur.top?.x ?? 0.5 };
-            }
-            const centre = typeof cur === 'number' ? cur : clamp(scene.suggested_center);
-            // SPLIT halves crop vertically as well, so each carries the face
-            // height the backend measured for this scene.
-            const y = scene.suggested_center_y ?? 0.5;
-            return { ...o, [idx]: {
-                top: { x: clamp(centre - 0.2), y },
-                bottom: { x: clamp(centre + 0.2), y },
-            } };
-        });
     }, [clamp]);
 
     const resetScene = useCallback((idx) => {
@@ -114,8 +76,8 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
     const adjusted = Object.keys(overrides).length;
     const preset = data?.layout_preset;
     const dirty = !!data && JSON.stringify(overrides) !== JSON.stringify(data.saved_overrides || {});
-    const chooseGrid = (index) => setOverrides((current) => ({
-        ...current, [index]: { layout: 'panel', boxes: data.grid_defaults },
+    const setLayout = (index, layout, boxes, gameplayPercent) => setOverrides((current) => ({
+        ...current, [index]: { layout, boxes, ...(gameplayPercent == null ? {} : { gameplay_percent: gameplayPercent }) },
     }));
 
     const togglePlayback = async (idx) => {
@@ -155,7 +117,7 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
             if (onReframed) onReframed(clipIndex, res);
             onClose();
         } catch (e) {
-            setError(e?.message || 'The re-render failed.');
+            setError(e?.detail || e?.message || 'The re-render failed.');
         } finally {
             setSaving(false);
         }
@@ -182,7 +144,7 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
                 <div className="flex-1 overflow-y-auto overscroll-contain custom-scrollbar p-4 space-y-5">
                     <p className="text-xs text-muted leading-relaxed">
                         {preset
-                            ? 'Select a crop box to move or resize it. Apply reframing to render this clip again.'
+                            ? 'Select one panel to move or resize its crop. Check the layout preview before applying your changes.'
                             : 'Play a scene to hear who is talking, then drag the rectangle over the person you want. Untouched scenes keep the automatic crop.'}
                     </p>
 
@@ -201,39 +163,56 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
                     )}
 
                     {data?.scenes?.map((scene) => {
-                        const mode = overrides[scene.index]?.layout || preset;
+                        const override = overrides[scene.index];
+                        const touched = scene.index in overrides;
+                        const resetting = !touched && scene.index in (data.saved_overrides || {});
+                        const presetApplied = !resetting && scene.preset_applied;
+                        const automaticMode = !presetApplied && !resetting && scene.rendered_split_boxes ? 'split'
+                            : preset === 'panel' && !presetApplied ? null : preset;
+                        const mode = touched ? override?.layout || (scene.legacy_split_boxes ? 'split' : null)
+                            : automaticMode;
                         const onGrid = data.grid_defaults && mode !== 'panel'
-                            ? () => chooseGrid(scene.index) : null;
+                            ? () => setLayout(scene.index, 'panel', data.grid_defaults) : null;
+                        const playback = {
+                            previewUrl,
+                            playing: playing === scene.index && !!previewUrl,
+                            loadingPreview: playing === scene.index && previewLoading,
+                            onPlayToggle: () => togglePlayback(scene.index),
+                        };
+                        const onReset = () => resetScene(scene.index);
                         return mode ? (
                         <PresetScene
                             key={`${scene.index}-${mode}`}
                             scene={scene}
                             preset={mode}
-                            defaults={mode === preset ? data.preset_defaults : data.grid_defaults}
-                            boxes={overrides[scene.index]?.boxes || scene.preset_boxes}
-                            touched={scene.index in overrides}
-                            onChange={(boxes) => setOverrides((current) => ({
-                                ...current, [scene.index]: { layout: mode, boxes },
-                            }))}
+                            sourceAspect={data.source_width / data.source_height}
+                            outputWidth={data.output_width}
+                            outputHeight={data.output_height}
+                            gridDefaults={data.grid_defaults}
+                            gameplayPercent={override?.gameplay_percent ?? 60}
+                            boxes={override?.boxes ?? (mode === 'split'
+                                ? scene.rendered_split_boxes ?? scene.legacy_split_boxes ?? scene.split_defaults
+                                : resetting ? data.preset_defaults : scene.preset_boxes)}
+                            touched={touched}
+                            onChange={(boxes, percent) => setLayout(scene.index, mode, boxes, percent)}
                             onGrid={onGrid}
-                            onReset={() => resetScene(scene.index)}
+                            onSingle={() => setSingle(scene.index, scene.suggested_center)}
+                            onReset={onReset}
+                            {...playback}
                         />
                     ) : (
                         <SceneRow
                             key={scene.index}
                             scene={scene}
-                            value={valueOf(scene)}
+                            value={clamp(typeof override === 'number' ? override : scene.suggested_center)}
                             widthFraction={data.crop_width_fraction}
-                            previewUrl={previewUrl}
-                            touched={scene.index in overrides}
-                            playing={playing === scene.index && !!previewUrl}
-                            loadingPreview={playing === scene.index && previewLoading}
-                            onPlayToggle={() => togglePlayback(scene.index)}
+                            touched={touched}
+                            gridFallback={preset === 'panel' && !touched}
                             onMoveSingle={(f) => setSingle(scene.index, f)}
-                            onMoveHalf={(which, f) => setSplitHalf(scene.index, which, f)}
-                            onToggleSplit={() => toggleSplit(scene.index, scene)}
+                            onSplit={() => setLayout(scene.index, 'split', scene.split_defaults)}
                             onGrid={onGrid}
-                            onReset={() => resetScene(scene.index)}
+                            onReset={onReset}
+                            {...playback}
                         />
                         );
                     })}
@@ -265,15 +244,58 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
 
 const clampTo = (value, max) => Math.max(0, Math.min(max, value));
 
-function PresetScene({ scene, preset, defaults, boxes, touched, onChange, onReset, onGrid }) {
+function panelSizes(preset, count, width, height, gameplayPercent) {
+    if (preset === 'gaming') {
+        const top = 2 * Math.round(height * gameplayPercent / 200);
+        return [[width, top], [width, height - top]];
+    }
+    const halfHeight = 2 * Math.floor(height / 4);
+    if (preset === 'split') return [[width, halfHeight], [width, halfHeight]];
+    const tile = [2 * Math.floor(width / 4), halfHeight];
+    return count === 3 ? [tile, tile, [width, height - halfHeight]] : [tile, tile, tile, tile];
+}
+
+function resizeBoxForPanel(box, [width, height], sourceAspect) {
+    const [x, y, oldW, oldH] = box;
+    const ratio = width / height / sourceAspect;
+    const h = Math.min(1, 1 / ratio, Math.max(oldH, .02, .02 / ratio));
+    const w = h * ratio;
+    return [clampTo(x + (oldW - w) / 2, 1 - w), clampTo(y + (oldH - h) / 2, 1 - h), w, h];
+}
+
+function PresetScene({ scene, preset, sourceAspect, outputWidth, outputHeight, gridDefaults,
+    boxes, gameplayPercent, touched, onChange, onReset, onGrid, onSingle,
+    previewUrl, playing, loadingPreview, onPlayToggle }) {
     const mediaRef = useRef(null);
     const dragRef = useRef(null);
+    const fourthBox = useRef(gridDefaults?.[3]);
     const [selected, setSelected] = useState(0);
-    const labels = preset === 'gaming'
-        ? ['Gameplay', 'Facecam'] : ['Top left', 'Top right', 'Bottom left', 'Bottom right'];
+    const videoRef = useScenePlayback(scene, playing);
+    const gaming = preset === 'gaming';
+    const grid = preset === 'panel';
+    const labels = gaming ? ['Gameplay', 'Facecam'] : !grid ? ['Top', 'Bottom']
+        : boxes.length === 3 ? ['Top left', 'Top right', 'Bottom']
+        : ['Top left', 'Top right', 'Bottom left', 'Bottom right'];
+    const sizes = panelSizes(preset, boxes.length, outputWidth, outputHeight, gameplayPercent);
     const active = boxes[selected];
+    const thumbnail = scene.thumbnail_url ? getApiUrl(scene.thumbnail_url) : null;
 
-    const update = (index, box) => onChange(boxes.map((current, i) => i === index ? box : current));
+    const update = (index, box) => onChange(boxes.map((current, i) => i === index ? box : current),
+        gaming ? gameplayPercent : undefined);
+    const resizeGameplay = (percent) => {
+        const nextSizes = panelSizes(preset, 2, outputWidth, outputHeight, percent);
+        onChange(boxes.map((box, i) => resizeBoxForPanel(box, nextSizes[i], sourceAspect)), percent);
+    };
+    const setPanelCount = (count) => {
+        if (count === boxes.length) return;
+        if (count === 3) fourthBox.current = boxes[3];
+        const next = boxes.slice(0, 3);
+        const nextSizes = panelSizes(preset, count, outputWidth, outputHeight, gameplayPercent);
+        next[2] = resizeBoxForPanel(next[2], nextSizes[2], sourceAspect);
+        if (count === 4) next.push(fourthBox.current);
+        setSelected((i) => Math.min(i, count - 1));
+        onChange(next);
+    };
     const move = (index, box, dx, dy) => {
         const [x, y, w, h] = box;
         update(index, [clampTo(x + dx, 1 - w), clampTo(y + dy, 1 - h), w, h]);
@@ -302,18 +324,26 @@ function PresetScene({ scene, preset, defaults, boxes, touched, onChange, onRese
     return (
         <div className="space-y-2.5">
             <div className="flex items-center justify-between gap-3 text-xs">
-                <span className="readout">
-                    scene {scene.index + 1} · {fmt(scene.start)}–{fmt(scene.end)}
-                </span>
+                <ScenePlaybackButton {...{ scene, playing, loadingPreview, onPlayToggle }} />
                 <div className="flex flex-wrap justify-end gap-1">
                     {onGrid && <button type="button" onClick={onGrid} className="btn-quiet px-2 py-1">
                         2×2 grid
                     </button>}
+                    <button type="button" onClick={onSingle} className="btn-quiet px-2 py-1">
+                        Use single crop
+                    </button>
                     {touched && <button type="button" onClick={onReset} className="btn-quiet px-2 py-1">
                         Reset to auto
                     </button>}
                 </div>
             </div>
+            {grid && <div className="flex flex-wrap gap-1.5" role="group" aria-label="Panel count">
+                {[3, 4].map((count) => <button key={count} type="button" aria-pressed={boxes.length === count}
+                    onClick={() => setPanelCount(count)}
+                    className={`${boxes.length === count ? 'btn-primary' : 'btn-quiet'} px-2 py-1 text-xs`}>
+                    {count} panels
+                </button>)}
+            </div>}
             <div className="flex flex-wrap gap-1.5">
                 {labels.map((label, i) => (
                     <button key={label} type="button" aria-pressed={selected === i}
@@ -323,70 +353,101 @@ function PresetScene({ scene, preset, defaults, boxes, touched, onChange, onRese
                     </button>
                 ))}
             </div>
-            <div ref={mediaRef} className="relative overflow-hidden select-none rounded-input border border-rule">
-                {scene.thumbnail_url
-                    ? <img src={getApiUrl(scene.thumbnail_url)} alt="Uncropped source frame"
-                        draggable={false} className="block w-full" />
-                    : <div className="aspect-video bg-paper3" />}
-                {boxes.map((box, i) => {
-                    if (!box) return null;
-                    const [x, y, w, h] = box;
-                    const isActive = selected === i;
-                    return <button type="button" key={labels[i]} aria-label={`Move ${labels[i]} crop`}
-                        tabIndex={isActive ? 0 : -1}
-                        className={`absolute border-2 touch-none ${isActive ? 'z-10 border-brass cursor-move' : 'pointer-events-none border-white/65'}`}
-                        style={{ left: `${x * 100}%`, top: `${y * 100}%`,
-                            width: `${w * 100}%`, height: `${h * 100}%` }}
-                        onPointerDown={(e) => startDrag(e, i)} onPointerMove={drag}
-                        onLostPointerCapture={() => { dragRef.current = null; }}
-                        onKeyDown={(e) => {
-                            const delta = { ArrowLeft: [-1, 0], ArrowRight: [1, 0],
-                                ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
-                            if (!delta) return;
-                            e.preventDefault();
-                            const step = e.shiftKey ? .05 : .01;
-                            move(i, box, delta[0] * step, delta[1] * step);
-                        }}>
-                        <span aria-hidden="true" className="absolute left-0 top-0 bg-paper text-ink px-1 text-xs">
-                            {i + 1}
-                        </span>
-                    </button>;
-                })}
+            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(120px,26%)]">
+                <div className="min-w-0 space-y-2">
+                    <div ref={mediaRef} className="relative overflow-hidden select-none rounded-input bg-paper3 ring-1 ring-rule"
+                        style={{ aspectRatio: sourceAspect }}>
+                        {playing ? <video ref={videoRef} src={getApiUrl(previewUrl)} playsInline
+                            className="absolute inset-0 h-full w-full" />
+                            : thumbnail && <img src={thumbnail} alt="Uncropped source frame" loading="lazy"
+                                draggable={false} className="absolute inset-0 h-full w-full" />}
+                        {active && <button key={selected} type="button" aria-label={`Move ${labels[selected]} crop`}
+                            className="absolute border-2 border-brass touch-none cursor-move"
+                            style={{ left: `${active[0] * 100}%`, top: `${active[1] * 100}%`,
+                                width: `${active[2] * 100}%`, height: `${active[3] * 100}%` }}
+                            onPointerDown={(e) => startDrag(e, selected)} onPointerMove={drag}
+                            onLostPointerCapture={() => { dragRef.current = null; }}
+                            onKeyDown={(e) => {
+                                const delta = { ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+                                    ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+                                if (!delta) return;
+                                e.preventDefault();
+                                const step = e.shiftKey ? .05 : .01;
+                                move(selected, active, delta[0] * step, delta[1] * step);
+                            }}>
+                            <span aria-hidden="true" className="absolute left-0 top-0 bg-paper text-ink px-1 text-xs">
+                                {selected + 1}
+                            </span>
+                        </button>}
+                    </div>
+                    {active && <label className="flex items-center gap-2 text-xs text-muted">
+                        {labels[selected]} crop size
+                        <input type="range" className="min-w-0 flex-1" step="any"
+                            min={Math.max(.02, .02 * active[2] / active[3])}
+                            max={Math.min(1, active[2] / active[3])}
+                            value={active[2]} onChange={(e) => resize(Number(e.target.value))} />
+                    </label>}
+                    {gaming && <label className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                        <span>Gameplay height {gameplayPercent}% · Facecam {100 - gameplayPercent}%</span>
+                        <input type="range" aria-label="Gameplay height" className="min-w-24 flex-1"
+                            min={40} max={80} value={gameplayPercent}
+                            onChange={(e) => resizeGameplay(Number(e.target.value))} />
+                    </label>}
+                    {grid && selected === 3 && (
+                        <button type="button" className="btn-quiet px-2 py-1 text-xs"
+                            onClick={() => update(3, active ? null : gridDefaults[3])}>
+                            {active ? 'Use wide shot' : 'Crop fourth panel'}
+                        </button>
+                    )}
+                </div>
+                {thumbnail && <PresetPreview thumbnail={thumbnail} grid={grid} boxes={boxes}
+                    sizes={sizes} outputWidth={outputWidth} outputHeight={outputHeight}
+                    selected={selected} sourceAspect={sourceAspect} />}
             </div>
-            <div className="flex flex-wrap items-center gap-3 text-xs">
-                {active && <label className="flex min-w-40 flex-1 items-center gap-2 text-muted">
-                    {labels[selected]} crop size
-                    <input type="range" className="min-w-0 flex-1" step="any"
-                        min={Math.max(.02, .02 * active[2] / active[3])}
-                        max={Math.min(1, active[2] / active[3])}
-                        value={active[2]} onChange={(e) => resize(Number(e.target.value))} />
-                </label>}
-                {preset === 'panel' && selected === 3 && (
-                    <button type="button" className="btn-quiet px-2 py-1"
-                        onClick={() => update(3, active ? null : defaults[3])}>
-                        {active ? 'Use wide shot' : 'Crop fourth panel'}
-                    </button>
-                )}
-            </div>
-            {!touched && !scene.preset_applied && <p className="text-xs text-muted">
+            {gaming && !touched && !scene.preset_applied && <p className="text-xs text-muted">
                 This scene used a fallback layout. Adjust any box to apply the preset here.
             </p>}
         </div>
     );
 }
 
+function PresetPreview({ thumbnail, grid, boxes, sizes, selected, sourceAspect, outputWidth, outputHeight }) {
+    const bottom = sizes[grid ? 2 : 1][1];
+    return (
+        <figure className="mx-auto w-full max-w-[11rem] sm:max-w-none">
+            <figcaption className="mb-1 text-xs text-muted">Layout preview · still frame</figcaption>
+            <div className={`grid overflow-hidden rounded-input bg-black ring-1 ring-rule ${grid ? 'grid-cols-2' : ''}`}
+                style={{ aspectRatio: outputWidth / outputHeight,
+                    gridTemplateRows: `${100 * sizes[0][1] / outputHeight}% ${100 * bottom / outputHeight}%` }}>
+                {boxes.map((box, i) => {
+                    let style;
+                    if (box) {
+                        const [x, y, width, height] = box;
+                        const tileAspect = sizes[i][0] / sizes[i][1];
+                        // Match the renderer's centred cover crop inside the selected box.
+                        const w = Math.min(width, height * tileAspect / sourceAspect);
+                        const h = w * sourceAspect / tileAspect;
+                        style = {
+                            width: `${100 / w}%`, height: `${100 / h}%`,
+                            left: `${-100 * (x + (width - w) / 2) / w}%`,
+                            top: `${-100 * (y + (height - h) / 2) / h}%`,
+                        };
+                    }
+                    return <div key={i} className={`relative overflow-hidden ${grid && boxes.length === 3 && i === 2 ? 'col-span-2' : ''}`}>
+                        <img src={thumbnail} alt="" loading="lazy" draggable={false}
+                            className={`absolute max-w-none ${box ? '' : 'inset-0 h-full w-full object-contain'}`}
+                            style={style} />
+                        {selected === i && <div className="pointer-events-none absolute inset-0 border border-brass" />}
+                    </div>;
+                })}
+            </div>
+        </figure>
+    );
+}
 
-// One scene. While it plays, the frame is replaced by the uncropped preview
-// seeked to this scene, so the rectangle can be judged against moving pictures
-// and sound rather than a single still.
-function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing, loadingPreview,
-                    onPlayToggle, onMoveSingle, onMoveHalf, onToggleSplit, onGrid, onReset }) {
-    const boxRef = useRef(null);
+
+function useScenePlayback(scene, playing) {
     const videoRef = useRef(null);
-    const [dragging, setDragging] = useState(null);   // null | 'single' | 'top' | 'bottom'
-
-    const isSplit = value && typeof value === 'object';
-
     // Play only this scene's slice of the shared preview.
     useEffect(() => {
         const v = videoRef.current;
@@ -398,6 +459,29 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing, l
         v.addEventListener('timeupdate', stopAtEnd);
         return () => v.removeEventListener('timeupdate', stopAtEnd);
     }, [playing, scene.start, scene.end]);
+    return videoRef;
+}
+
+function ScenePlaybackButton({ scene, playing, loadingPreview, onPlayToggle }) {
+    const label = loadingPreview ? 'preparing preview' : playing ? 'pause scene' : 'play this scene with sound';
+    return (
+        <div className="flex items-center gap-2 min-w-0">
+            <button type="button" onClick={onPlayToggle} aria-label={label} title={label}
+                className="flex items-center text-ink2 hover:text-brass transition-colors">
+                {loadingPreview ? <Loader2 size={13} className="animate-spin" />
+                    : playing ? <Pause size={13} /> : <Play size={13} />}
+            </button>
+            <span className="readout text-muted truncate">
+                scene {scene.index + 1} · {fmt(scene.start)}–{fmt(scene.end)}
+            </span>
+        </div>
+    );
+}
+
+function SceneRow({ scene, value, widthFraction, previewUrl, touched, gridFallback, playing, loadingPreview,
+                    onPlayToggle, onMoveSingle, onSplit, onGrid, onReset }) {
+    const boxRef = useRef(null);
+    const videoRef = useScenePlayback(scene, playing);
 
     const fractionFromEvent = useCallback((clientX) => {
         const el = boxRef.current;
@@ -406,82 +490,24 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing, l
         return (clientX - rect.left) / rect.width;
     }, []);
 
-    useEffect(() => {
-        if (!dragging) return;
-        const move = (e) => {
-            const x = e.touches ? e.touches[0].clientX : e.clientX;
-            const f = fractionFromEvent(x);
-            if (dragging === 'single') onMoveSingle(f);
-            else onMoveHalf(dragging, f);
-        };
-        const up = () => setDragging(null);
-        window.addEventListener('mousemove', move);
-        window.addEventListener('mouseup', up);
-        window.addEventListener('touchmove', move);
-        window.addEventListener('touchend', up);
-        return () => {
-            window.removeEventListener('mousemove', move);
-            window.removeEventListener('mouseup', up);
-            window.removeEventListener('touchmove', move);
-            window.removeEventListener('touchend', up);
-        };
-    }, [dragging, fractionFromEvent, onMoveSingle, onMoveHalf]);
-
-    const startDrag = (which) => (e) => {
-        e.stopPropagation();
-        setDragging(which);
-        const x = e.touches ? e.touches[0].clientX : e.clientX;
-        if (which === 'single') onMoveSingle(fractionFromEvent(x));
-        else onMoveHalf(which, fractionFromEvent(x));
-    };
-
-    const win = (centre, label, which) => {
-        const leftPct = (centre - widthFraction / 2) * 100;
-        return (
-            <div
-                key={which}
-                onMouseDown={startDrag(which)}
-                onTouchStart={startDrag(which)}
-                className="absolute inset-y-0 border-2 border-brass cursor-ew-resize"
-                style={{ left: `${leftPct}%`, width: `${widthFraction * 100}%` }}
-            >
-                {label && (
-                    <span className="absolute top-1 left-1 text-[10px] px-1 rounded bg-brass text-paper lowercase">
-                        {label}
-                    </span>
-                )}
-            </div>
-        );
-    };
+    const left = Math.max(0, (value - widthFraction / 2) * 100);
+    const right = Math.max(0, 100 - (value + widthFraction / 2) * 100);
 
     return (
         <div className="space-y-1.5">
             <div className="flex items-center justify-between text-xs gap-2">
-                <div className="flex items-center gap-2 min-w-0">
-                    <button
-                        onClick={onPlayToggle}
-                        className="flex items-center gap-1 text-ink2 hover:text-brass transition-colors"
-                        title={loadingPreview ? "preparing preview" : "play this scene with sound"}
-                    >
-                        {loadingPreview ? <Loader2 size={13} className="animate-spin" />
-                            : playing ? <Pause size={13} /> : <Play size={13} />}
-                    </button>
-                    <span className="readout text-muted truncate">
-                        scene {scene.index + 1} · {fmt(scene.start)}–{fmt(scene.end)}
-                    </span>
-                </div>
+                <ScenePlaybackButton {...{ scene, playing, loadingPreview, onPlayToggle }} />
                 <div className="flex items-center gap-3 shrink-0">
                     <button
-                        onClick={onToggleSplit}
-                        className={`flex items-center gap-1 transition-colors ${
-                            isSplit ? 'text-brass' : 'text-muted hover:text-ink2'}`}
+                        type="button" onClick={onSplit}
+                        className="flex items-center gap-1 text-muted hover:text-ink2 transition-colors"
                         title="stack two regions instead of one window"
                     >
                         <Columns2 size={12} /> split
                     </button>
                     {onGrid && <button type="button" onClick={onGrid}
                         className="flex items-center gap-1 text-muted hover:text-ink2"
-                        title="Use four independent crop boxes">
+                        title="Use three or four panels">
                         2×2 grid
                     </button>}
                     {touched ? (
@@ -493,6 +519,10 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing, l
                     )}
                 </div>
             </div>
+
+            {gridFallback && <p className="text-xs text-muted">
+                This scene uses automatic framing. Choose 2×2 grid to place three or four panels.
+            </p>}
 
             <div
                 ref={boxRef}
@@ -517,28 +547,24 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing, l
                     <div className="w-full aspect-video bg-paper3" />
                 )}
 
-                {/* Everything outside the kept region is dimmed, so what survives
-                    the crop is what stays bright. */}
-                {!isSplit && (
-                    <>
-                        <div className="absolute inset-y-0 left-0 bg-black/65 pointer-events-none"
-                             style={{ width: `${Math.max(0, (value - widthFraction / 2) * 100)}%` }} />
-                        <div className="absolute inset-y-0 right-0 bg-black/65 pointer-events-none"
-                             style={{ width: `${Math.max(0, 100 - (value + widthFraction / 2) * 100)}%` }} />
-                    </>
-                )}
-
-                {isSplit
-                    ? [win(value.top.x, 'top', 'top'), win(value.bottom.x, 'bottom', 'bottom')]
-                    : win(value, null, 'single')}
+                <div className="absolute inset-y-0 left-0 bg-black/65 pointer-events-none" style={{ width: `${left}%` }} />
+                <div className="absolute inset-y-0 right-0 bg-black/65 pointer-events-none" style={{ width: `${right}%` }} />
+                <button type="button" aria-label="Move single crop"
+                    className="absolute inset-y-0 border-2 border-brass touch-pan-y cursor-ew-resize"
+                    style={{ left: `${left}%`, width: `${widthFraction * 100}%` }}
+                    onPointerDown={(e) => {
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        onMoveSingle(fractionFromEvent(e.clientX));
+                    }}
+                    onPointerMove={(e) => {
+                        if (e.currentTarget.hasPointerCapture(e.pointerId)) onMoveSingle(fractionFromEvent(e.clientX));
+                    }}
+                    onKeyDown={(e) => {
+                        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+                        e.preventDefault();
+                        onMoveSingle(value + (e.key === 'ArrowLeft' ? -.01 : .01));
+                    }} />
             </div>
-
-            {isSplit && (
-                <p className="text-[11px] text-muted leading-snug">
-                    Two regions stacked in the vertical frame: <strong>top</strong> above,
-                    <strong> bottom</strong> below. Drag each one onto the person it should hold.
-                </p>
-            )}
         </div>
     );
 }
