@@ -7,8 +7,10 @@ trips with the render stubbed at recut.perform_recut.
 """
 
 import asyncio
+import io
 import json
 import os
+import zipfile
 
 import httpx
 import pytest
@@ -112,6 +114,85 @@ class TestReframeValidation:
 
 
 class TestReframeRender:
+    def test_grid_override_can_be_used_without_upload_preset(self, job, fake_recut):
+        panel = {"layout": "panel", "boxes": [
+            [.1, .1, .18, .5], [.33, .1, .18, .5], [.55, .1, .18, .5], None,
+        ]}
+        req = {"job_id": JOB_ID, "clip_index": 0, "crop_overrides": {"0": panel}}
+        assert _request("POST", "/api/clip/reframe", req).status_code == 200
+        assert fake_recut[0]["layout_preset"] is None
+        assert fake_recut[0]["crop_overrides"][0] == panel
+
+    def test_download_labels_match_mp4_even_with_a_missing_earlier_clip(self, job):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["shorts"].append({
+            "start": 42., "end": 57.,
+            "video_title_for_youtube_short": "Judul kedua",
+            "video_description_for_tiktok": "Caption TT #dua",
+            "video_description_for_instagram": "Caption IG #dua",
+        })
+        job["meta_path"].write_text(json.dumps(meta))
+        (job["dir"] / "mytitle_clip_1.mp4").unlink()
+        (job["dir"] / "mytitle_clip_2.mp4").write_bytes(b"second clip")
+        app_module.jobs[JOB_ID]["result"]["clips"] = [{
+            "video_url": f"/videos/{JOB_ID}/mytitle_clip_2.mp4",
+        }]
+        res = _request("GET", f"/api/jobs/{JOB_ID}/download-all")
+        assert res.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(res.content)) as bundle:
+            assert bundle.namelist() == ["clip_02_mytitle_clip_2.mp4", "Judul-dan-caption.txt"]
+            text = bundle.read("Judul-dan-caption.txt").decode("utf-8")
+            assert "clip_02_mytitle_clip_2.mp4" in text
+            assert "Judul kedua" in text and "Caption TT #dua" in text and "Caption IG #dua" in text
+
+    def test_cached_scenes_return_before_preview_and_reuse_scene_bounds(self, job, fake_recut, monkeypatch):
+        from scene_cache import SceneCache, key_for
+        segments = [{"start": 10., "end": 40.}]
+        cache = SceneCache(job["dir"], 0, key_for(job["dir"] / "src.mp4", segments))
+        cache.save(1920, 1080, [
+            {"index": 0, "start": 0, "end": 15, "has_thumbnail": False, "suggested_center": .5},
+            {"index": 1, "start": 15, "end": 30, "has_thumbnail": False, "suggested_center": .5},
+        ])
+        preview_calls = []
+
+        def make_preview(source, segments, output, directory, *, preview):
+            assert preview
+            preview_calls.append(output)
+            cache.preview.with_name(os.path.basename(output)).write_bytes(b"preview")
+
+        monkeypatch.setattr(recut, "run_cut_concat", make_preview)
+        url = f"/api/clip/{JOB_ID}/0/scenes"
+        for _ in range(2):
+            res = _request("GET", url)
+            assert res.status_code == 200
+            assert res.json()["preview_url"] is None
+        assert preview_calls == []
+        for _ in range(2):
+            assert _request("GET", res.json()["preview_request_url"]).status_code == 200
+        assert len(preview_calls) == 1
+        assert _request("GET", url).json()["preview_url"].endswith(cache.preview.name)
+
+        req = {"job_id": JOB_ID, "clip_index": 0, "scene_key": cache.key,
+               "crop_overrides": {"1": .4}}
+        assert _request("POST", "/api/clip/reframe", req).status_code == 200
+        assert fake_recut[0]["scene_ranges"] == [(0, 15), (15, 30)]
+        assert _request("POST", "/api/clip/reframe", {**req, "scene_key": "old"}).status_code == 409
+
+    def test_preset_boxes_round_trip_and_reset(self, job, fake_recut):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["layout_preset"] = "gaming"
+        job["meta_path"].write_text(json.dumps(meta))
+        boxes = {"layout": "gaming", "boxes": [[.1, 0, .5, .9], [.75, .65, .2, .25]]}
+        req = {"job_id": JOB_ID, "clip_index": 0, "crop_overrides": {"0": boxes}}
+        assert _request("POST", "/api/clip/reframe", req).status_code == 200
+        assert fake_recut[0]["layout_preset"] == "gaming"
+        assert fake_recut[0]["crop_overrides"][0] == boxes
+        saved = json.loads(job["meta_path"].read_text())["shorts"][0]
+        assert saved["crop_overrides"] == {"0": boxes}
+        req.update(crop_overrides={}, reset_automatic=True)
+        assert _request("POST", "/api/clip/reframe", req).status_code == 200
+        assert fake_recut[1]["crop_overrides"] == {}
+
     def test_renders_from_source_with_overrides_and_captions(self, job, fake_recut):
         resp = _request("POST", "/api/clip/reframe", {
             "job_id": JOB_ID, "clip_index": 0,

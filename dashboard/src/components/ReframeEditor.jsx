@@ -27,9 +27,11 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [data, setData] = useState(null);
-    const [overrides, setOverrides] = useState({});   // idx -> number | {top,bottom}
+    const [overrides, setOverrides] = useState({});
     const [playing, setPlaying] = useState(null);     // scene index being played
     const [saving, setSaving] = useState(false);
+    const [previewUrl, setPreviewUrl] = useState(null);
+    const [previewLoading, setPreviewLoading] = useState(false);
 
     useEffect(() => {
         let alive = true;
@@ -38,6 +40,7 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
                 const res = await apiJson(`/api/clip/${jobId}/${clipIndex}/scenes`);
                 if (!alive) return;
                 setData(res);
+                setPreviewUrl(res.preview_url);
                 // Start from what is already applied. A re-render rebuilds
                 // from source with only what it receives, so opening blank
                 // would quietly discard every earlier adjustment on the next
@@ -109,23 +112,45 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
     }, []);
 
     const adjusted = Object.keys(overrides).length;
+    const preset = data?.layout_preset;
+    const dirty = !!data && JSON.stringify(overrides) !== JSON.stringify(data.saved_overrides || {});
+    const chooseGrid = (index) => setOverrides((current) => ({
+        ...current, [index]: { layout: 'panel', boxes: data.grid_defaults },
+    }));
+
+    const togglePlayback = async (idx) => {
+        if (playing === idx) {
+            setPlaying(null);
+            return;
+        }
+        setPlaying(idx);
+        if (previewUrl || previewLoading || !data?.preview_request_url) return;
+        setPreviewLoading(true);
+        setError(null);
+        try {
+            const res = await apiJson(data.preview_request_url);
+            setPreviewUrl(res.preview_url);
+        } catch (e) {
+            setPlaying(null);
+            setError(e?.message || 'Could not load the scene preview.');
+        } finally {
+            setPreviewLoading(false);
+        }
+    };
 
     const handleSave = async () => {
-        if (!adjusted || saving) return;
+        if (!dirty || saving) return;
         setSaving(true);
         setError(null);
         try {
-            const payload = Object.fromEntries(Object.entries(overrides).map(([k, v]) => [
-                String(k),
-                typeof v === 'object'
-                    ? { top: { x: Number(v.top.x.toFixed(4)), y: Number(v.top.y.toFixed(4)) },
-                        bottom: { x: Number(v.bottom.x.toFixed(4)), y: Number(v.bottom.y.toFixed(4)) } }
-                    : Number(v.toFixed(4)),
-            ]));
             const res = await apiJson('/api/clip/reframe', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ job_id: jobId, clip_index: clipIndex, crop_overrides: payload }),
+                body: JSON.stringify({
+                    job_id: jobId, clip_index: clipIndex, crop_overrides: overrides,
+                    reset_automatic: !adjusted,
+                    scene_key: data.scene_key,
+                }),
             });
             if (onReframed) onReframed(clipIndex, res);
             onClose();
@@ -156,9 +181,9 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
 
                 <div className="flex-1 overflow-y-auto overscroll-contain custom-scrollbar p-4 space-y-5">
                     <p className="text-xs text-muted leading-relaxed">
-                        Play a scene to hear who is talking, then drag the rectangle over
-                        the person you want. Each scene is one camera. Scenes you leave
-                        alone keep the automatic camera.
+                        {preset
+                            ? 'Select a crop box to move or resize it. Apply reframing to render this clip again.'
+                            : 'Play a scene to hear who is talking, then drag the rectangle over the person you want. Untouched scenes keep the automatic crop.'}
                     </p>
 
                     {loading && (
@@ -175,35 +200,56 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
                         </div>
                     )}
 
-                    {data?.scenes?.map((scene) => (
+                    {data?.scenes?.map((scene) => {
+                        const mode = overrides[scene.index]?.layout || preset;
+                        const onGrid = data.grid_defaults && mode !== 'panel'
+                            ? () => chooseGrid(scene.index) : null;
+                        return mode ? (
+                        <PresetScene
+                            key={`${scene.index}-${mode}`}
+                            scene={scene}
+                            preset={mode}
+                            defaults={mode === preset ? data.preset_defaults : data.grid_defaults}
+                            boxes={overrides[scene.index]?.boxes || scene.preset_boxes}
+                            touched={scene.index in overrides}
+                            onChange={(boxes) => setOverrides((current) => ({
+                                ...current, [scene.index]: { layout: mode, boxes },
+                            }))}
+                            onGrid={onGrid}
+                            onReset={() => resetScene(scene.index)}
+                        />
+                    ) : (
                         <SceneRow
                             key={scene.index}
                             scene={scene}
                             value={valueOf(scene)}
                             widthFraction={data.crop_width_fraction}
-                            previewUrl={data.preview_url}
+                            previewUrl={previewUrl}
                             touched={scene.index in overrides}
-                            playing={playing === scene.index}
-                            onPlayToggle={() => setPlaying((p) => (p === scene.index ? null : scene.index))}
+                            playing={playing === scene.index && !!previewUrl}
+                            loadingPreview={playing === scene.index && previewLoading}
+                            onPlayToggle={() => togglePlayback(scene.index)}
                             onMoveSingle={(f) => setSingle(scene.index, f)}
                             onMoveHalf={(which, f) => setSplitHalf(scene.index, which, f)}
                             onToggleSplit={() => toggleSplit(scene.index, scene)}
+                            onGrid={onGrid}
                             onReset={() => resetScene(scene.index)}
                         />
-                    ))}
+                        );
+                    })}
                 </div>
 
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 border-t border-rule">
                     <span className="text-xs text-muted">
                         {adjusted === 0
-                            ? 'nothing adjusted yet'
+                            ? (dirty ? 'automatic framing will be restored' : 'no manual adjustments')
                             : `${adjusted} scene${adjusted > 1 ? 's' : ''} reframed by hand`}
                     </span>
                     <div className="flex items-center gap-2 [&>button]:flex-1 sm:[&>button]:flex-none">
                         <button onClick={onClose} className="btn-quiet py-2 px-4 text-sm">cancel</button>
                         <button
                             onClick={handleSave}
-                            disabled={!adjusted || saving}
+                            disabled={!dirty || saving}
                             className="btn-primary py-2 px-4 text-sm disabled:opacity-40"
                         >
                             {saving ? <Loader2 size={16} className="animate-spin" /> : null}
@@ -217,12 +263,124 @@ export default function ReframeEditor({ jobId, clipIndex, clipTitle, onClose, on
     );
 }
 
+const clampTo = (value, max) => Math.max(0, Math.min(max, value));
+
+function PresetScene({ scene, preset, defaults, boxes, touched, onChange, onReset, onGrid }) {
+    const mediaRef = useRef(null);
+    const dragRef = useRef(null);
+    const [selected, setSelected] = useState(0);
+    const labels = preset === 'gaming'
+        ? ['Gameplay', 'Facecam'] : ['Top left', 'Top right', 'Bottom left', 'Bottom right'];
+    const active = boxes[selected];
+
+    const update = (index, box) => onChange(boxes.map((current, i) => i === index ? box : current));
+    const move = (index, box, dx, dy) => {
+        const [x, y, w, h] = box;
+        update(index, [clampTo(x + dx, 1 - w), clampTo(y + dy, 1 - h), w, h]);
+    };
+    const resize = (w) => {
+        const [x, y, oldW, oldH] = active;
+        const h = w * oldH / oldW;
+        update(selected, [clampTo(x + (oldW - w) / 2, 1 - w),
+            clampTo(y + (oldH - h) / 2, 1 - h), w, h]);
+    };
+
+    const startDrag = (e, index) => {
+        const rect = mediaRef.current.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        dragRef.current = { index, box: boxes[index], x: e.clientX, y: e.clientY, rect };
+    };
+    const drag = (e) => {
+        const current = dragRef.current;
+        if (!current) return;
+        move(current.index, current.box,
+            (e.clientX - current.x) / current.rect.width,
+            (e.clientY - current.y) / current.rect.height);
+    };
+
+    return (
+        <div className="space-y-2.5">
+            <div className="flex items-center justify-between gap-3 text-xs">
+                <span className="readout">
+                    scene {scene.index + 1} · {fmt(scene.start)}–{fmt(scene.end)}
+                </span>
+                <div className="flex flex-wrap justify-end gap-1">
+                    {onGrid && <button type="button" onClick={onGrid} className="btn-quiet px-2 py-1">
+                        2×2 grid
+                    </button>}
+                    {touched && <button type="button" onClick={onReset} className="btn-quiet px-2 py-1">
+                        Reset to auto
+                    </button>}
+                </div>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+                {labels.map((label, i) => (
+                    <button key={label} type="button" aria-pressed={selected === i}
+                        onClick={() => setSelected(i)}
+                        className={`${selected === i ? 'btn-primary' : 'btn-quiet'} px-2 py-1 text-xs`}>
+                        {i + 1}. {label}
+                    </button>
+                ))}
+            </div>
+            <div ref={mediaRef} className="relative overflow-hidden select-none rounded-input border border-rule">
+                {scene.thumbnail_url
+                    ? <img src={getApiUrl(scene.thumbnail_url)} alt="Uncropped source frame"
+                        draggable={false} className="block w-full" />
+                    : <div className="aspect-video bg-paper3" />}
+                {boxes.map((box, i) => {
+                    if (!box) return null;
+                    const [x, y, w, h] = box;
+                    const isActive = selected === i;
+                    return <button type="button" key={labels[i]} aria-label={`Move ${labels[i]} crop`}
+                        tabIndex={isActive ? 0 : -1}
+                        className={`absolute border-2 touch-none ${isActive ? 'z-10 border-brass cursor-move' : 'pointer-events-none border-white/65'}`}
+                        style={{ left: `${x * 100}%`, top: `${y * 100}%`,
+                            width: `${w * 100}%`, height: `${h * 100}%` }}
+                        onPointerDown={(e) => startDrag(e, i)} onPointerMove={drag}
+                        onLostPointerCapture={() => { dragRef.current = null; }}
+                        onKeyDown={(e) => {
+                            const delta = { ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+                                ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+                            if (!delta) return;
+                            e.preventDefault();
+                            const step = e.shiftKey ? .05 : .01;
+                            move(i, box, delta[0] * step, delta[1] * step);
+                        }}>
+                        <span aria-hidden="true" className="absolute left-0 top-0 bg-paper text-ink px-1 text-xs">
+                            {i + 1}
+                        </span>
+                    </button>;
+                })}
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-xs">
+                {active && <label className="flex min-w-40 flex-1 items-center gap-2 text-muted">
+                    {labels[selected]} crop size
+                    <input type="range" className="min-w-0 flex-1" step="any"
+                        min={Math.max(.02, .02 * active[2] / active[3])}
+                        max={Math.min(1, active[2] / active[3])}
+                        value={active[2]} onChange={(e) => resize(Number(e.target.value))} />
+                </label>}
+                {preset === 'panel' && selected === 3 && (
+                    <button type="button" className="btn-quiet px-2 py-1"
+                        onClick={() => update(3, active ? null : defaults[3])}>
+                        {active ? 'Use wide shot' : 'Crop fourth panel'}
+                    </button>
+                )}
+            </div>
+            {!touched && !scene.preset_applied && <p className="text-xs text-muted">
+                This scene used a fallback layout. Adjust any box to apply the preset here.
+            </p>}
+        </div>
+    );
+}
+
 
 // One scene. While it plays, the frame is replaced by the uncropped preview
 // seeked to this scene, so the rectangle can be judged against moving pictures
 // and sound rather than a single still.
-function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
-                    onPlayToggle, onMoveSingle, onMoveHalf, onToggleSplit, onReset }) {
+function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing, loadingPreview,
+                    onPlayToggle, onMoveSingle, onMoveHalf, onToggleSplit, onGrid, onReset }) {
     const boxRef = useRef(null);
     const videoRef = useRef(null);
     const [dragging, setDragging] = useState(null);   // null | 'single' | 'top' | 'bottom'
@@ -303,9 +461,10 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
                     <button
                         onClick={onPlayToggle}
                         className="flex items-center gap-1 text-ink2 hover:text-brass transition-colors"
-                        title="play this scene with sound"
+                        title={loadingPreview ? "preparing preview" : "play this scene with sound"}
                     >
-                        {playing ? <Pause size={13} /> : <Play size={13} />}
+                        {loadingPreview ? <Loader2 size={13} className="animate-spin" />
+                            : playing ? <Pause size={13} /> : <Play size={13} />}
                     </button>
                     <span className="readout text-muted truncate">
                         scene {scene.index + 1} · {fmt(scene.start)}–{fmt(scene.end)}
@@ -320,6 +479,11 @@ function SceneRow({ scene, value, widthFraction, previewUrl, touched, playing,
                     >
                         <Columns2 size={12} /> split
                     </button>
+                    {onGrid && <button type="button" onClick={onGrid}
+                        className="flex items-center gap-1 text-muted hover:text-ink2"
+                        title="Use four independent crop boxes">
+                        2×2 grid
+                    </button>}
                     {touched ? (
                         <button onClick={onReset} className="flex items-center gap-1 text-brass hover:underline">
                             <RotateCcw size={12} /> automatic

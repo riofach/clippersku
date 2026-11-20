@@ -28,6 +28,8 @@ import camera_inset
 import punch_in
 import screencast_layout
 import layout_ranges
+import preset_layout
+from reframe_render_cache import digest as render_digest
 import split_layout
 from ffmpeg_utils import (video_encode_args, blurred_backdrop, escape_filter_value,
                           QUALITY_FAST, METADATA_SCRUB)
@@ -233,6 +235,10 @@ def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
         if end_f <= start_f:
             continue
 
+        if isinstance(value, dict) and "layout" in value:
+            # Preset rectangles are applied by preset_layout. The legacy
+            # split override below uses a different wire format.
+            continue
         if isinstance(value, dict):
             # Split: the halves are centres in SOURCE PIXELS, which is what
             # split_filtergraph expects — unlike the single-crop path, there is
@@ -272,7 +278,8 @@ def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
 
 
 # Layouts whose crop is fixed for the whole scene: no camera trajectory.
-_STATIC_LAYOUTS = ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE', 'INSET', 'ALTERNATE')
+_STATIC_LAYOUTS = ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE', 'INSET', 'ALTERNATE',
+                   'GAMING', 'PANEL')
 
 # Decode only the frames the trajectory runs a detector on (see
 # _detection_frames). SPARSE_TRAJECTORY=0 pipes every frame again.
@@ -584,7 +591,7 @@ def screen_ranges(input_video, scenes, fps, strategies):
 
 
 def encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
-                  workdir, logo, final_output_video):
+                  workdir, logo, final_output_video, render_cache=None):
     """Encode the scene specs into ``final_output_video`` with the clip's audio.
 
     The whole clip in one pass on the card when it can (gpu_render);
@@ -608,7 +615,18 @@ def encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
 
     if video_in is None:
         segments = []
-        for idx, (ss, dur, graph, _boxes) in enumerate(specs):
+        for idx, (ss, dur, graph, boxes) in enumerate(specs):
+            signature = None
+            if render_cache is not None and not logo:
+                # TRACK carries all its per-frame geometry in boxes. Its
+                # filtergraph also contains a temporary sendcmd filename.
+                stable_graph = graph.split(",crop@c=", 1)[-1] if boxes else graph
+                signature = render_digest((ss, dur, orig_w, orig_h, out_w, out_h,
+                                           fps, video_encode_args(QUALITY_FAST), stable_graph, boxes))
+                cached = render_cache.segment(idx, signature)
+                if cached:
+                    segments.append(cached)
+                    continue
             seg_path = os.path.join(workdir, f"seg_{idx:03d}.mp4")
             extra, out_label = [], "[v]"
             if logo:
@@ -616,6 +634,8 @@ def encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
                 graph += ";" + m.watermark_filter(out_w, out_h, video="[v]", out="[vw]")
                 out_label = "[vw]"
             _run_segment(input_video, ss, dur, extra, graph, out_label, seg_path)
+            if signature is not None:
+                render_cache.save_segment(idx, signature, seg_path)
             segments.append(seg_path)
 
         list_path = os.path.join(workdir, "concat.txt")
@@ -640,7 +660,8 @@ def encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
 
 
 def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
-           force_strategy=None, crop_overrides=None, watermark=False):
+           force_strategy=None, crop_overrides=None, watermark=False, layout_preset=None,
+           scene_ranges=None, render_cache=None):
     """Full v2 reframe of one clip. Raises on failure (caller falls back).
 
     ``content_ranges`` pins which stretches (in this clip's timeline) show a
@@ -666,7 +687,22 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     content_ranges = content_ranges or []
 
     print("   🚀 Reframe engine v2 (ffmpeg-native render)")
-    scenes, fps = m.detect_scenes(input_video)
+    if scene_ranges:
+        import cv2
+        from scenedetect import FrameTimecode
+        cap = cv2.VideoCapture(input_video)
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+        finally:
+            cap.release()
+        if not fps > 0:
+            raise RuntimeError("could not read the cut's frame rate")
+        # Match the scene indices the editor showed, including clips rebuilt
+        # from a multi-segment cut. Avoid running the detector over them again.
+        scenes = [(FrameTimecode(round(start * fps), fps),
+                   FrameTimecode(round(end * fps), fps)) for start, end in scene_ranges]
+    else:
+        scenes, fps = m.detect_scenes(input_video)
     fps = float(fps)  # PySceneDetect can hand back a Fraction
     orig_w, orig_h = m.get_video_resolution(input_video)
 
@@ -696,9 +732,13 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         content_ranges = []
         print(f"   ↕️  Source is already {orig_w}x{orig_h} vertical — "
               f"passing it through, no reframe")
+    elif layout_preset == preset_layout.GAMING:
+        # Faces inside the gameplay are not subjects to follow.
+        strategies = ['WIDE'] * len(scenes)
+        content_ranges = []
     else:
         strategies = m.analyze_scenes_strategy(input_video, scenes)
-        if not content_ranges and screencast_layout.ENABLED:
+        if not layout_preset and not content_ranges and screencast_layout.ENABLED:
             content_ranges = screen_ranges(input_video, scenes, fps, strategies)
 
     # SPLIT is an upgrade applied on top of the TRACK/GENERAL verdict, keyed by
@@ -708,7 +748,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # that begin past the last decoded frame, and those get dropped).
     splits = {}
     split_scene_of = {}
-    detected_splits = {} if passthrough else split_layout.detect_split_scenes(
+    detected_splits = {} if passthrough or layout_preset else split_layout.detect_split_scenes(
         input_video, scenes, strategies)
     for scene_idx, centres in detected_splits.items():
         strategies[scene_idx] = 'SPLIT'
@@ -807,6 +847,35 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     if inset_count:
         print(f"   📹 Camera-inset layout on {inset_count} scene(s)")
 
+    preset_boxes = {}
+    overrides = crop_overrides or {}
+    if layout_preset in preset_layout.PRESETS:
+        if not force_strategy and not passthrough:
+            selected = preset_layout.automatic(
+                layout_preset, input_video, scenes, strategies, scene_boundaries,
+                orig_w, orig_h, out_w, out_h, overrides)
+        else:
+            selected = {}
+        for i, boxes in selected.items():
+            start_f = scene_boundaries[i][0]
+            strategies[i] = layout_preset.upper()
+            preset_boxes[start_f] = boxes
+            alternates.pop(start_f, None)
+            focus_crops.pop(start_f, None)
+        if preset_boxes:
+            print(f"   🖼️ {layout_preset.upper()} preset on {len(preset_boxes)} scene(s)")
+
+    # A manual grid is a choice for this scene, even on a project that was
+    # generated with a different upload preset.
+    for i, value in overrides.items():
+        if (0 <= i < len(scenes) and isinstance(value, dict)
+                and value.get("layout") in preset_layout.PRESETS):
+            start_f = scene_boundaries[i][0]
+            strategies[i] = value["layout"].upper()
+            preset_boxes[start_f] = preset_layout.pixels(value["boxes"], orig_w, orig_h)
+            alternates.pop(start_f, None)
+            focus_crops.pop(start_f, None)
+
     # The crop geometry comes from the SOURCE dims only — SmoothedCameraman
     # derives crop_width/crop_height from video_width/video_height and never
     # reads the output pair. So out_w/out_h being the (possibly upscaled)
@@ -868,7 +937,10 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
             dur = (end_f - start_f) / fps
             boxes = None
 
-            if strategy == 'INSET':
+            if strategy in ('GAMING', 'PANEL'):
+                graph = preset_layout.filtergraph(
+                    strategy.lower(), preset_boxes[start_f], orig_w, orig_h, out_w, out_h)
+            elif strategy == 'INSET':
                 graph = camera_inset.inset_filtergraph(
                     orig_w, orig_h, out_w, out_h, insets.get(start_f, inset))
             elif strategy == 'SCREENCAST':
@@ -922,7 +994,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
             specs.append((ss, dur, graph, boxes))
 
         encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
-                      workdir, logo, final_output_video)
+                      workdir, logo, final_output_video,
+                      **({"render_cache": render_cache} if render_cache else {}))
     finally:
         import shutil
         shutil.rmtree(workdir, ignore_errors=True)
@@ -930,7 +1003,9 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # Tell the caption pass which stretches are stacked, and the hook where a
     # WIDE picture sits (see layout_ranges).
     layout_ranges.write(final_output_video,
-                        [(s / fps, e / fps, strategy, bands.get(s))
+                        [(s / fps, e / fps, strategy, bands.get(s),
+                          preset_layout.fractions(preset_boxes[s], orig_w, orig_h)
+                          if strategy in ('GAMING', 'PANEL') else None)
                          for s, e, strategy in ranges])
     print(f"   ✅ Clip saved to {final_output_video}")
     return True

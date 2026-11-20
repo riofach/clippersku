@@ -19,13 +19,54 @@ only way to lose it was to run the whole job again: the first cancellation
 for "clip quality" was a user who paid 15 minutes after their first job and
 found the mark still there on every download and every restyle.
 
-No imports beyond the standard library on purpose: ``main.py``, ``app.py``
-and ``cloud/videos.py`` all use it and only the first of those has ffmpeg.
+The self-hosted HihuClip instance also uses the delivery-copy convention
+so edits can start from a clean master.
 """
 import os
 import re
+import subprocess
+import tempfile
 
 PREFIX = "wm_"
+
+
+def hihuclip_enabled() -> bool:
+    return (os.getenv("HIHUCLIP_WATERMARK") == "1"
+            and os.getenv("BILLING_ENABLED", "").lower() not in ("1", "true", "yes"))
+
+
+def mark_hihuclip_delivery(path: str) -> str:
+    """Burn the brand into the delivered MP4, preserving the editable input."""
+    from ffmpeg_utils import QUALITY_FAST, video_encode_args
+
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    marked_path = os.path.join(directory, marked_name(path))
+    if os.path.isfile(marked_path) and os.path.getsize(marked_path) > 0:
+        if os.path.getmtime(marked_path) >= os.path.getmtime(path):
+            return marked_path
+
+    drawtext = ("drawtext=fontfile=fonts/Montserrat-ExtraBold.ttf:text=@HihuClip:"
+                "fontsize=w/29:x=w*0.055:y=h*0.13:"
+                "fontcolor=white@0.9:borderw=2:bordercolor=black@0.65")
+    fd, temporary_path = tempfile.mkstemp(prefix=".hihuclip-", suffix=".mp4", dir=directory)
+    os.close(fd)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", path,
+             "-map", "0:v:0", "-map", "0:a?", "-vf", drawtext,
+             *video_encode_args(QUALITY_FAST), "-c:a", "copy",
+             "-movflags", "+faststart+use_metadata_tags", temporary_path],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, errors="replace", timeout=1800,
+        )
+        if result.returncode or not os.path.getsize(temporary_path):
+            raise RuntimeError(f"HihuClip watermark failed: {result.stderr.strip()[-500:]}")
+        os.replace(temporary_path, marked_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+    return marked_path
 
 # The dotfile ``main.py`` writes in a job directory rendered for the free plan.
 # Read by the ``/videos`` guard (a dotfile is never servable itself); removed

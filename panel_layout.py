@@ -7,15 +7,12 @@ for exactly this and we had nothing.
 
 Geometry, for a 1080x1920 output:
 
-    3 people   three stacked bands, 1080x640 each
-    4 people   a 2x2 grid, 540x960 each
+    3 people   three portrait tiles and a wide shot in the fourth
+    4 people   four portrait tiles, one per person
 
-Three stacked rather than 2+1, because an odd tile reads as a mistake; four as a
-grid rather than four bands, because a 1080x480 band is a letterbox slot nobody
-fits in. Both keep every tile the same size: a bigger tile silently claims the
-person in it is the important one, and the layout has no way to know that.
+Both cases use a 2x2 grid with 540x960 tiles, so each crop can frame one person.
 
-Off by default (``PANEL_LAYOUT=1``). Shares split_layout's rules, because the
+The Podcast preset enables this detector. It shares split_layout's rules because the
 failure modes are the same ones: faces must COEXIST in the frame (otherwise it
 is a multi-camera cut and tiling would show one person several times), be far
 enough apart, and be big enough not to be an audience.
@@ -183,19 +180,25 @@ def neighbour_gaps(centres):
     return gaps
 
 
+def panel_boxes(orig_w, orig_h, tile_w, tile_h, centres):
+    boxes = [panel_geometry(orig_w, orig_h, tile_w, tile_h, centre, neighbour_gap=gap)
+             for centre, gap in zip(centres, neighbour_gaps(centres))]
+    return boxes + [None] if len(boxes) == 3 else boxes
+
+
 def panel_filtergraph(orig_w, orig_h, out_w, out_h, centres):
     """Tile 3 or 4 people into the vertical frame, left-to-right, top-to-bottom."""
     count = len(centres)
     cols, rows, tile_w, tile_h = tile_grid(count, out_w, out_h)
 
-    gaps = neighbour_gaps(centres)
     streams = count if count == 4 else count + 1   # trio needs the wide shot
 
     parts = [f"[0:v]split={streams}"
              + "".join(f"[s{i}]" for i in range(streams)) + ";"]
-    for i, centre in enumerate(centres):
-        cw, ch, cx, cy = panel_geometry(orig_w, orig_h, tile_w, tile_h, centre,
-                                        neighbour_gap=gaps[i])
+    for i, box in enumerate(panel_boxes(orig_w, orig_h, tile_w, tile_h, centres)):
+        if box is None:
+            continue
+        cw, ch, cx, cy = box
         parts.append(f"[s{i}]crop=w={cw}:h={ch}:x={cx}:y={cy},"
                      f"scale={tile_w}:{tile_h}[t{i}];")
 
@@ -211,14 +214,14 @@ def panel_filtergraph(orig_w, orig_h, out_w, out_h, centres):
     return "".join(parts)
 
 
-def detect_panel_scenes(video_path, scenes, strategies, samples=None):
+def detect_panel_scenes(video_path, scenes, strategies, samples=None, *, enabled=None):
     """Scenes to render as PANEL: ``{scene_index: [centres]}``.
 
     Only scenes the classifier already sent to GENERAL are considered, for the
     same reason SPLIT does it: GENERAL already means "more than one face", and
     single-speaker material is most of the corpus and must not be touched.
     """
-    if not ENABLED:
+    if not (ENABLED if enabled is None else enabled):
         return {}
     # Below the gate on purpose: main pulls torch/mediapipe, and the disabled
     # path (the default, and what CI exercises) must not pay that import.

@@ -180,7 +180,7 @@ def virtual_transcript(transcript, segments):
     }
 
 
-def cut_commands(input_path, segments, part_paths):
+def cut_commands(input_path, segments, part_paths, *, preview=False):
     """ffmpeg argv for each segment cut. Re-encodes for frame-accurate cuts
     with uniform parameters so the parts concat cleanly."""
     commands = []
@@ -190,7 +190,9 @@ def cut_commands(input_path, segments, part_paths):
             "-ss", str(seg["start"]),
             "-to", str(seg["end"]),
             "-i", input_path,
-            *video_encode_args(QUALITY_FAST),
+            *(["-vf", r"scale=trunc(min(640\,iw)/2)*2:-2", "-c:v", "libx264",
+               "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p"]
+              if preview else video_encode_args(QUALITY_FAST)),
             *audio_encode_args(),
             # Every final-artifact producer in the repo scrubs source metadata
             # and fronts the moov atom (a fast-path recut IS the delivered
@@ -213,11 +215,11 @@ def concat_command(list_path, out_path):
     ]
 
 
-def run_cut_concat(input_path, segments, out_path, workdir, runner=None):
+def run_cut_concat(input_path, segments, out_path, workdir, runner=None, *, preview=False):
     """Cut every segment from ``input_path`` and join them into ``out_path``."""
     run = runner or _run_ffmpeg
     if len(segments) == 1:
-        run(cut_commands(input_path, segments, [out_path])[0])
+        run(cut_commands(input_path, segments, [out_path], preview=preview)[0])
         return out_path
 
     # Unique per invocation: two concurrent recuts in the same job dir must
@@ -229,7 +231,7 @@ def run_cut_concat(input_path, segments, out_path, workdir, runner=None):
     ]
     list_path = os.path.join(workdir, f"temp_recut_concat_{token}.txt")
     try:
-        for command in cut_commands(input_path, segments, part_paths):
+        for command in cut_commands(input_path, segments, part_paths, preview=preview):
             run(command)
         with open(list_path, "w") as f:
             for part in part_paths:
@@ -266,7 +268,9 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
                   reframe=False, output_format="auto", watermark=False,
                   captions_transcript=None, force_strategy=None,
                   crop_overrides=None, runner=None, renderer=None,
-                  watermarker=None, captioner=None, subtitle_band=None):
+                  watermarker=None, captioner=None, subtitle_band=None,
+                  layout_preset=None, hooker=None, scene_ranges=None,
+                  render_cache=None):
     """Render a recut clip. Returns (served_filename, clean_filename).
 
     - ``input_path``/``segments``: the file to cut from and the times ON THAT
@@ -297,8 +301,16 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
     work_path = os.path.join(output_dir, work_name)
 
     try:
-        run_cut_concat(input_path, segments, work_path, output_dir,
-                       runner=runner)
+        if render_cache is not None and (not reframe or not render_cache.prepare()):
+            render_cache = None
+        if render_cache is not None:
+            if not render_cache.cut.is_file():
+                run_cut_concat(input_path, segments, work_path, output_dir, runner=runner)
+                os.replace(work_path, render_cache.cut)
+            render_input = str(render_cache.cut)
+        else:
+            run_cut_concat(input_path, segments, work_path, output_dir, runner=runner)
+            render_input = work_path
 
         if reframe:
             if renderer is not None:
@@ -309,8 +321,11 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
                 def render(i, o, f):
                     return main_render(i, o, f, force_strategy=force_strategy,
                                        crop_overrides=crop_overrides,
-                                       subtitle_band=subtitle_band)
-            if not render(work_path, out_path, output_format):
+                                       subtitle_band=subtitle_band,
+                                       **({"layout_preset": layout_preset} if layout_preset else {}),
+                                       **({"scene_ranges": scene_ranges} if scene_ranges else {}),
+                                       **({"render_cache": render_cache} if render_cache else {}))
+            if not render(render_input, out_path, output_format):
                 raise RuntimeError("reframe failed on the recut clip")
         else:
             shutil.move(work_path, out_path)
@@ -319,16 +334,17 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
             # ranges through the cut instead (empty when the input has none).
             import layout_ranges
             layout_ranges.write(out_path, [
-                (r["start"], r["end"], r["layout"], r.get("content"))
+                (r["start"], r["end"], r["layout"], r.get("content"), r.get("boxes"))
                 for r in layout_ranges.remap(layout_ranges.read(input_path), segments)])
 
         if watermark:
             (watermarker or _main_attr("apply_watermark"))(out_path)
 
-        served_name = out_name
+        caption_source = hooker(out_path) if hooker else out_path
+        served_name = os.path.basename(caption_source)
         if captions_transcript and captions_transcript.get("segments"):
             caption = captioner or _main_attr("auto_caption_clip")
-            captioned = caption(out_path, captions_transcript,
+            captioned = caption(caption_source, captions_transcript,
                                 0.0, total_duration(segments))
             if captioned:
                 served_name = os.path.basename(captioned)

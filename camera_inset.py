@@ -191,7 +191,7 @@ def usable(box, frame_h, min_ratio=MIN_INSET_HEIGHT, max_ratio=MAX_INSET_HEIGHT)
     return min_ratio * frame_h <= box[3] <= max_ratio * frame_h
 
 
-def detect(video_path, samples=10):
+def detect(video_path, samples=10, *, prefer_corner=False):
     """Median inset rectangle across sampled frames, or None.
 
     None means "no usable inset here", which callers must treat as "use another
@@ -224,6 +224,9 @@ def detect(video_path, samples=10):
             # BlazeFace even at full resolution, while YOLO still finds the
             # person.
             faces = screencast_layout.detect_faces_full_res(frame)
+            if prefer_corner:
+                faces = [candidate for candidate in faces
+                         if is_cornered(candidate['box'], frame_w, frame_h)]
             if faces:
                 box = max(faces, key=lambda c: c['score'])['box']
             else:

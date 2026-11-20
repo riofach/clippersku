@@ -42,6 +42,8 @@ def write(video_path, ranges):
         band = _band(r[3] if len(r) > 3 else None)
         if band:
             entry["content"] = list(band)
+        if len(r) > 4 and r[4] is not None:
+            entry["boxes"] = r[4]
         payload.append(entry)
     try:
         with open(sidecar_path(video_path), "w") as f:
@@ -85,9 +87,11 @@ def normalise(ranges):
             if isinstance(r, dict):
                 s, e, layout = r["start"], r["end"], r.get("layout", "")
                 band = r.get("content")
+                boxes = r.get("boxes")
             else:
                 s, e, layout = r[:3]
                 band = r[3] if len(r) > 3 else None
+                boxes = r[4] if len(r) > 4 else None
             s, e = float(s), float(e)
         except (KeyError, TypeError, ValueError):
             continue
@@ -96,6 +100,8 @@ def normalise(ranges):
             band = _band(band)
             if band:
                 entry["content"] = list(band)
+            if boxes is not None:
+                entry["boxes"] = boxes
             out.append(entry)
     return out
 
@@ -133,6 +139,8 @@ def remap(ranges, segments):
                          "layout": r["layout"]}
                 if "content" in r:
                     moved["content"] = r["content"]
+                if "boxes" in r:
+                    moved["boxes"] = r["boxes"]
                 out.append(moved)
         offset += seg_e - seg_s
     return out

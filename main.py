@@ -1624,7 +1624,8 @@ def trim_subtitle_band(input_video, band):
 
 def render_clip(input_video, final_output_video, output_format="auto",
                 force_strategy=None, crop_overrides=None, watermark=False,
-                subtitle_band=None):
+                subtitle_band=None, layout_preset=None, scene_ranges=None,
+                render_cache=None):
     """Route a cut clip through the right renderer for the chosen output format.
     vertical/auto -> 9:16 reframe, square -> 1:1 reframe, horizontal -> keep.
     ``force_strategy`` (e.g. 'WIDE'/'TRACK') pins every scene's layout — the
@@ -1640,14 +1641,16 @@ def render_clip(input_video, final_output_video, output_format="auto",
     trimmed = trim_subtitle_band(input_video, subtitle_band)
     try:
         return _render_clip(trimmed, final_output_video, output_format,
-                            force_strategy, crop_overrides, watermark)
+                            force_strategy, crop_overrides, watermark, layout_preset,
+                            scene_ranges, render_cache)
     finally:
         if trimmed != input_video and os.path.exists(trimmed):
             os.remove(trimmed)
 
 
 def _render_clip(input_video, final_output_video, output_format,
-                 force_strategy, crop_overrides, watermark):
+                 force_strategy, crop_overrides, watermark, layout_preset=None,
+                 scene_ranges=None, render_cache=None):
     if output_format == "horizontal":
         ok = finalize_clip_passthrough(input_video, final_output_video)
         if ok and watermark:
@@ -1657,7 +1660,8 @@ def _render_clip(input_video, final_output_video, output_format,
     return process_video_to_vertical(input_video, final_output_video, aspect_ratio=aspect,
                                      force_strategy=force_strategy,
                                      crop_overrides=crop_overrides,
-                                     watermark=watermark)
+                                     watermark=watermark, layout_preset=layout_preset,
+                                     scene_ranges=scene_ranges, render_cache=render_cache)
 
 
 # Watermark geometry, as fractions of the clip width/height.
@@ -1772,7 +1776,8 @@ def mark_delivery(final_path, marker=None):
 
 
 def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPECT_RATIO,
-                              force_strategy=None, crop_overrides=None, watermark=False):
+                              force_strategy=None, crop_overrides=None, watermark=False,
+                              layout_preset=None, scene_ranges=None, render_cache=None):
     """
     Core logic to reframe a horizontal video to a target aspect ratio using
     scene detection and Active Speaker Tracking (MediaPipe).
@@ -1783,14 +1788,15 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
     """
     # v2 engine: analyze downscaled, render natively in ffmpeg. Any failure
     # falls back to the v1 frame loop below so a v2 edge case can't kill jobs.
-    if os.environ.get("REFRAME_ENGINE", "v2").strip().lower() != "v1":
+    if layout_preset or scene_ranges or os.environ.get("REFRAME_ENGINE", "v2").strip().lower() != "v1":
         try:
             import reframe_v2
             t0 = time.time()
             result = reframe_v2.render(input_video, final_output_video, aspect_ratio,
                                        force_strategy=force_strategy,
                                        crop_overrides=crop_overrides,
-                                       watermark=watermark)
+                                       watermark=watermark, layout_preset=layout_preset,
+                                       scene_ranges=scene_ranges, render_cache=render_cache)
             print(f"   ⏱️ Reframe v2 total: {time.time() - t0:.1f}s")
             return result
         except Exception as e:
@@ -1798,9 +1804,9 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
             # through to v1 would quietly return an automatically framed clip,
             # and the user would see their correction vanish with no reason
             # given — so surface the failure instead of discarding their input.
-            if crop_overrides or force_strategy:
+            if crop_overrides or force_strategy or layout_preset or scene_ranges:
                 raise RuntimeError(
-                    f"manual framing needs the v2 reframe engine, which failed "
+                    f"requested framing needs the v2 reframe engine, which failed "
                     f"({type(e).__name__}: {e})") from e
             print(f"   ⚠️ Reframe v2 failed ({type(e).__name__}: {e}) — "
                   f"falling back to v1 frame loop")
@@ -2765,6 +2771,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     output_format = args.format
+    layout_preset = os.getenv("CLIP_LAYOUT_PRESET") if output_format in ("auto", "vertical") else None
 
     script_start_time = time.time()
 
@@ -2948,7 +2955,7 @@ if __name__ == '__main__':
     # instead of one per clip, and the answer is a property of the material
     # ("this is a screencast"), which does not change between its own clips.
     # It runs before any render so the modules are switched on in time.
-    if layout_picker.ENABLED:
+    if layout_picker.ENABLED and not layout_preset:
         try:
             _cap = cv2.VideoCapture(input_video)
             _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -2971,7 +2978,7 @@ if __name__ == '__main__':
     # our captions are the only text layer (burned_subtitles.py). Only when we
     # caption at all, and never on a vertical source, which is passed through.
     source_subtitle_band = None
-    if (not args.skip_analysis
+    if (not args.skip_analysis and not layout_preset
             and os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"):
         try:
             import burned_subtitles
@@ -3099,6 +3106,8 @@ if __name__ == '__main__':
             # --keep-original) or in uploads/ (upload jobs).
             clips_data['source_video'] = os.path.basename(input_video)
             clips_data['output_format'] = output_format
+            if layout_preset:
+                clips_data['layout_preset'] = layout_preset
             if source_subtitle_band:
                 clips_data['source_subtitle_band'] = source_subtitle_band
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
@@ -3108,6 +3117,10 @@ if __name__ == '__main__':
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
+            import watermarked
+
+            hihuclip_watermark = watermarked.hihuclip_enabled()
+
             def _process_one_clip(i, clip):
                 if clip.get('pro_before'):
                     # A retry of a clip whose first attempt got as far as pro
@@ -3138,7 +3151,8 @@ if __name__ == '__main__':
                     # made. Each worker writes only its own clip dict, so the
                     # re-dump after the pool is race-free.
                     success = render_clip(clip_temp_path, clip_final_path, output_format,
-                                          subtitle_band=source_subtitle_band)
+                                          subtitle_band=source_subtitle_band,
+                                          layout_preset=layout_preset)
                     if success:
                         print(f"   🎞️ Clip {i+1} framed")
                     deliver_path = clip_final_path
@@ -3149,7 +3163,8 @@ if __name__ == '__main__':
                     # The hook was written from the transcript alone. When the
                     # render put this clip's meaning on the screen, rewrite hook
                     # and title from three of its frames BEFORE burning them.
-                    if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
+                    if success and not layout_preset and hook_grounding.wanted(
+                            clip['layout_ranges'], end - start):
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
                     captioned = None
                     # Pro mode replaces the file the hook and the captions go
@@ -3184,7 +3199,9 @@ if __name__ == '__main__':
                                 mark=os.environ.get("WATERMARK") == "1",
                                 style=cap_style)
                         served = captioned or deliver_path
-                        if os.environ.get("WATERMARK") == "1":
+                        if hihuclip_watermark:
+                            served = watermarked.mark_hihuclip_delivery(served)
+                        elif os.environ.get("WATERMARK") == "1":
                             served = mark_delivery(served)
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
                         # Hand the API the file to actually serve for this clip.
@@ -3207,10 +3224,9 @@ if __name__ == '__main__':
             clip_workers = max(int(os.environ.get("CLIP_WORKERS", "6")), 1)
             shorts = clips_data['shorts']
             failed = []
-            if os.environ.get("WATERMARK") == "1":
+            if hihuclip_watermark or os.environ.get("WATERMARK") == "1":
                 # Tells the /videos guard that the clean twins in this
                 # directory are not for serving (watermarked.MARKER_FILE).
-                import watermarked
                 watermarked.mark_job(output_dir)
             with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
                 # Best clip first: the pool starts work in submission order, so

@@ -284,7 +284,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 <button
                                     key={f.value}
                                     type="button"
-                                    onClick={() => setOutputFormat(f.value)}
+                                    onClick={() => {
+                                        setOutputFormat(f.value);
+                                        if (f.value !== 'vertical' && ['gaming', 'panel'].includes(layout)) {
+                                            setLayout('auto');
+                                        }
+                                    }}
                                     className={`py-3 px-2 rounded-input border flex flex-col items-center gap-2 transition-colors
                                         ${active ? 'border-[color:var(--color-accent)] text-ink' : 'border-rule2 text-muted hover:border-[color:var(--color-accent)]'}`}
                                 >
@@ -362,15 +367,30 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 <span className="text-xs text-ink2">vertical layout</span>
                                 <select
                                     value={layout}
-                                    onChange={(e) => setLayout(e.target.value)}
-                                    className="input-field !w-auto text-xs py-1.5"
+                                    onChange={(e) => {
+                                        setLayout(e.target.value);
+                                        if (['gaming', 'panel'].includes(e.target.value)) {
+                                            setOutputFormat('vertical');
+                                        }
+                                    }}
+                                    className="input-field !w-auto max-w-full text-xs py-1.5"
                                     aria-label="vertical layout"
                                 >
                                     <option value="auto">Auto (AI picks per video)</option>
                                     <option value="split">Two speakers stacked</option>
+                                    <option value="panel">Podcast · 3–4 people (2×2)</option>
+                                    <option value="gaming">Gaming · 60% gameplay / 40% facecam</option>
                                     <option value="screencast">Screen over presenter</option>
                                     <option value="none">Single crop only</option>
                                 </select>
+                                {['gaming', 'panel'].includes(layout) && (
+                                    <p className="w-full text-[11px] leading-relaxed text-muted">
+                                        {layout === 'gaming'
+                                            ? 'Use a recording with the facecam visible. Gameplay fills the top panel and crops its sides.'
+                                            : 'Use a wide shot with the speakers visible together. Three faces leave one tile for the wide shot.'}
+                                        {' '}Adjust the crop boxes in Reframing after the clips are ready.
+                                    </p>
+                                )}
                             </div>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
