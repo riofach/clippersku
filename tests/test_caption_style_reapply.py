@@ -112,6 +112,17 @@ def test_classic_style_writes_an_srt(tmp_path, monkeypatch):
     assert srt == {"mc": 20, "md": 2.0}
 
 
+@pytest.mark.parametrize('style', ['classic', 'karaoke'])
+def test_custom_position_is_burned_into_ass_and_overrides_the_split_seam(tmp_path, style):
+    ass = tmp_path / 'position.ass'
+    app_module._write_caption_style(
+        str(ass), TRANSCRIPT, 10.0, 12.0,
+        {'style': style, 'position_x': 30, 'position_y': 25}, [(0, 2)])
+    dialogue = [line for line in ass.read_text(encoding='utf-8-sig').splitlines()
+                if line.startswith('Dialogue:')]
+    assert dialogue and all(r'{\an5\pos(48.60,72.00)}' in line for line in dialogue)
+
+
 def test_restyle_names_the_output_like_auto_captions(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "_burn_caption_style",
                         lambda *a, **k: True)

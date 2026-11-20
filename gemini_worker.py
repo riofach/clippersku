@@ -34,6 +34,8 @@ class ScoreResponse(BaseModel):
 class DetailClipModel(BaseModel):
     start: float
     end: float
+    event_start: Optional[float] = None
+    event_end: Optional[float] = None
     source_window_id: str
     predicted_score: int
     video_description_for_tiktok: str
@@ -56,6 +58,8 @@ class DetailResponse(BaseModel):
 class VisualClipModel(BaseModel):
     start: float
     end: float
+    event_start: Optional[float] = None
+    event_end: Optional[float] = None
     predicted_score: int
     video_description_for_tiktok: str
     video_description_for_instagram: str
@@ -65,6 +69,16 @@ class VisualClipModel(BaseModel):
 
 class VisualResponse(BaseModel):
     shorts: List[VisualClipModel]
+
+
+GAMING_STORY_RULES = """
+GAMING EDITING RULES (take priority over the 2-second opening rule):
+- Keep the original order: short setup or anticipation, the action itself, then the immediate outcome or streamer reaction.
+- Start at the useful lead-in before the action. Do not open on commentary or a reaction after a missed reveal, encounter, win, or failure.
+- Let the result land before ending. Cut dead time and unrelated chatter, not the action or reaction.
+- For each pick, when identifiable, return numeric event_start and event_end for the action itself, using the same timestamps as start and end.
+- With transcript-only input, use dialogue and sound cues as evidence and leave event timestamps unset when the action is ambiguous. Title the moment without inventing what happened on screen.
+"""
 
 
 VISUAL_PROMPT_TEMPLATE = """

@@ -178,6 +178,23 @@ def test_intro_blur_fades_out_under_the_hook(tmp_path):
     assert blurred > 60 and clear < 10
 
 
+@pytest.mark.parametrize('captions', [None, ('null', 10)])
+def test_auto_hook_defaults_to_blur_with_or_without_captions(tmp_path, monkeypatch, captions):
+    import hooks
+    import main
+
+    attempts = []
+    monkeypatch.setattr(hooks, 'add_hook_to_video',
+                        lambda source, text, output, **kwargs: attempts.append((text, kwargs)))
+    _, metadata = main.auto_hook_clip(
+        str(tmp_path / 'clip.mp4'), {'video_title_for_youtube_short': 'Fallback title'}, captions=captions)
+    assert metadata['intro_blur'] is True
+    assert attempts[0][0] == 'Fallback title'
+    assert attempts[0][1]['intro_blur'] is True
+    assert attempts[0][1]['has_captions'] is bool(captions)
+    assert ('also' in attempts[0][1]) is bool(captions)
+
+
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
                     reason="needs FFmpeg")
 def test_restyle_renders_saved_hook_and_subtitles_without_an_intermediate_video(tmp_path, monkeypatch):

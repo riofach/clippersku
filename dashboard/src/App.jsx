@@ -691,54 +691,57 @@ function App() {
     });
   };
 
-  // Apply one subtitle style to every clip of the job, sequentially.
-  const handleBulkSubtitles = async (options) => {
+  // Apply or remove subtitles one clip at a time so FFmpeg can use the CPU.
+  const handleBulkSubtitles = async (options, action = 'apply') => {
     const clips = results?.clips || [];
     const total = clips.length;
     if (!total) return;
-    setBulkSub({ running: true, current: 0, total, errors: 0 });
+    const remove = action === 'remove';
+    const style = remove ? {} : {
+      position: options.position,
+      position_x: options.positionX,
+      position_y: options.positionY,
+      font_size: options.fontSize,
+      font_name: options.fontName,
+      font_color: options.fontColor,
+      border_color: options.borderColor,
+      border_width: options.borderWidth,
+      bg_color: options.bgColor,
+      bg_opacity: options.bgOpacity,
+      style: options.style || 'pill',
+      highlight_color: options.highlightColor || '#FFD700',
+      effect: options.effect || 'none',
+      base_opacity: options.baseOpacity ?? 1.0,
+      uppercase: options.uppercase || false,
+      reveal: options.reveal || false,
+      shadow: options.shadow || 0,
+      max_chars: options.maxChars ?? null,
+      max_duration: options.maxDuration ?? null,
+      style_only: true,
+    };
+    setBulkSub({ running: true, current: 0, total, errors: 0, action });
     let errors = 0;
     for (let i = 0; i < total; i++) {
-      setBulkSub({ running: true, current: i + 1, total, errors });
+      setBulkSub({ running: true, current: i + 1, total, errors, action });
       try {
-        const res = await apiFetch('/api/subtitle', {
+        const res = await apiFetch(remove ? '/api/subtitle/remove' : '/api/subtitle', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            job_id: jobId,
-            clip_index: i,
-            position: options.position,
-            font_size: options.fontSize,
-            font_name: options.fontName,
-            font_color: options.fontColor,
-            border_color: options.borderColor,
-            border_width: options.borderWidth,
-            bg_color: options.bgColor,
-            bg_opacity: options.bgOpacity,
-            style: options.style || 'pill',
-            highlight_color: options.highlightColor || '#FFD700',
-            effect: options.effect || 'none',
-            base_opacity: options.baseOpacity ?? 1.0,
-            uppercase: options.uppercase || false,
-            reveal: options.reveal || false,
-            shadow: options.shadow || 0,
-            max_chars: options.maxChars ?? null,
-            max_duration: options.maxDuration ?? null,
-            style_only: true,
-          }),
+          body: JSON.stringify({ job_id: jobId, clip_index: i, ...style }),
         });
         if (!res.ok) errors++;
       } catch {
         errors++;
       }
     }
-    setBulkSub({ running: false, current: total, total, errors });
+    setBulkSub({ running: false, current: total, total, errors, action });
     refreshMe();
     // Refresh results so each ResultCard picks up its new subtitled video_url.
     try {
       const data = await pollJob(jobId);
-      if (data.result) setResults(data.result);
+      if (data.result && jobIdRef.current === jobId) setResults(data.result);
     } catch { /* keep current results */ }
+    return errors;
   };
 
   const handleDownloadAll = async () => {
@@ -1283,6 +1286,7 @@ function App() {
         // but the dashboard always states the user's choice.
         auto_hook: data.autoHook ? '1' : '0',
         auto_hook_style: data.autoHook ? (data.autoHookStyle || 'pill') : null,
+        captions: data.autoCaptions == null ? null : (data.autoCaptions ? '1' : '0'),
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
         // Set when the user took the quota wall's "clip the first N minutes"

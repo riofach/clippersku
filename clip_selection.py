@@ -189,7 +189,7 @@ def vision_segments(video_duration, segment_seconds, max_segments):
             for i in range(n_kept)]
 
 
-def clip_duration_bounds():
+def clip_duration_bounds(*, gaming=False):
     """The clip length band (seconds) the selection prompts and word-snapping
     enforce. ``CLIP_MIN_SECONDS`` / ``CLIP_MAX_SECONDS`` override the classic
     15-60 — set per job by /api/process when the user asks for a specific
@@ -204,13 +204,42 @@ def clip_duration_bounds():
         except ValueError:
             return default
 
-    lo = _read("CLIP_MIN_SECONDS", 15.0)
-    hi = _read("CLIP_MAX_SECONDS", 60.0)
+    lo = _read("CLIP_MIN_SECONDS", 25.0 if gaming else 15.0)
+    hi = _read("CLIP_MAX_SECONDS", 75.0 if gaming else 60.0)
     lo = min(max(lo, 5.0), 175.0)
     hi = min(max(hi, 10.0), 180.0)
     if hi < lo + 5.0:  # keep a real band: degenerate ranges starve the model
         hi = min(180.0, lo + 5.0)
     return round(lo, 3), round(hi, 3)
+
+
+def gaming_story_range(clip, duration, min_duration, max_duration):
+    """Keep the event in frame and make room for its setup and reaction."""
+    import math
+
+    start = min(duration, max(0.0, float(clip['start'])))
+    end = min(duration, max(start, float(clip['end'])))
+    event_start, event_end = clip.get('event_start'), clip.get('event_end')
+    if (isinstance(event_start, (int, float)) and isinstance(event_end, (int, float))
+            and math.isfinite(event_start) and math.isfinite(event_end)
+            and max(0, start - 15) <= event_start < event_end <= min(duration, end + 10)
+            and event_end - event_start <= max_duration):
+        core_start, core_end = event_start, event_end
+    else:
+        core_start, core_end = start, min(end, start + max_duration)
+
+    left = min(start, max(0.0, core_start - 10))
+    right = max(end, min(duration, core_end + 5))
+    if right - left > max_duration:
+        # Reserve reaction time before taking available lead-in. An anchor
+        # can point at an event just outside the originally proposed range.
+        tail = min(5.0, right - core_end, max(0.0, max_duration - (core_end - core_start)))
+        left = max(left, core_end + tail - max_duration)
+        right = min(right, left + max_duration)
+    if right - left < min_duration:
+        right = min(duration, left + min_duration)
+        left = max(0.0, min(left, right - min_duration))
+    return round(left, 3), round(right, 3)
 
 
 def compact_words(words, precision=2):

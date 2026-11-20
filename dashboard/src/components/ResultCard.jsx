@@ -544,6 +544,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     job_id: jobId,
                     clip_index: index,
                     position: options.position,
+                    position_x: options.positionX,
+                    position_y: options.positionY,
                     font_size: options.fontSize,
                     font_name: options.fontName,
                     font_color: options.fontColor,
@@ -562,7 +564,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     max_duration: options.maxDuration ?? null,
                     // Edited caption text (clip-relative ms); null = server
                     // regenerates from the transcript as before.
-                    words: options.captions || null
+                    words: options.captions || null,
+                    style_only: !options.captions,
                 })
             });
 
@@ -1323,10 +1326,12 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 onClose={() => setShowSubtitleModal(false)}
                 onGenerate={handleSubtitle}
                 onApplyAll={onBulkSubtitle ? async (options) => {
-                    await onBulkSubtitle(options);
-                    setShowSubtitleModal(false);
+                    if (await onBulkSubtitle(options) === 0) setShowSubtitleModal(false);
                 } : undefined}
                 onRemove={handleRemoveSubtitles}
+                onRemoveAll={onBulkSubtitle ? async () => {
+                    if (await onBulkSubtitle(null, 'remove') === 0) setShowSubtitleModal(false);
+                } : undefined}
                 bulkCount={clipCount}
                 bulkProgress={bulkProgress}
                 isProcessing={isSubtitling || (bulkProgress?.running ?? false)}

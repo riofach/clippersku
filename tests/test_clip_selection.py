@@ -2,6 +2,7 @@
 import re
 
 import pytest
+from clip_selection import clip_duration_bounds, gaming_story_range
 
 from clip_selection import (
     build_transcript_windows,
@@ -23,6 +24,23 @@ def _seg(start, end, text):
 
 def _word(w, s, e):
     return {"w": w, "s": s, "e": e}
+
+
+def test_gaming_keeps_the_setup_action_and_reaction():
+    assert gaming_story_range({'start': 50, 'end': 60}, 120, 25, 75) == (40, 65)
+    clip = {'start': 53, 'end': 62, 'event_start': 48, 'event_end': 52}
+    assert gaming_story_range(clip, 120, 25, 75) == (38, 63)
+    assert gaming_story_range(clip, 120, 10, 15) == (42, 57)
+    assert gaming_story_range({'start': 0, 'end': 8}, 8, 25, 75) == (0, 8)
+
+
+def test_gaming_defaults_are_longer_and_honor_explicit_max(monkeypatch):
+    monkeypatch.delenv('CLIP_MIN_SECONDS', raising=False)
+    monkeypatch.delenv('CLIP_MAX_SECONDS', raising=False)
+    assert clip_duration_bounds() == (15, 60)
+    assert clip_duration_bounds(gaming=True) == (25, 75)
+    monkeypatch.setenv('CLIP_MAX_SECONDS', '45')
+    assert clip_duration_bounds(gaming=True) == (25, 45)
 
 
 class TestBuildTranscriptWindows:

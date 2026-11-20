@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import (HTMLResponse, FileResponse, JSONResponse, StreamingResponse,
                                RedirectResponse, Response)
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
@@ -1762,7 +1762,7 @@ def _reapply_captions(job_id, clip_index, video_path):
 # silently swapped someone's small serif captions for big yellow Anton
 # (github issue #82).
 CAPTION_STYLE_FIELDS = (
-    "style", "position", "font_size", "font_name", "font_color",
+    "style", "position", "position_x", "position_y", "font_size", "font_name", "font_color",
     "border_color", "border_width", "bg_color", "bg_opacity",
     "highlight_color", "effect", "base_opacity", "uppercase", "reveal",
     "shadow", "max_chars", "max_duration")
@@ -1793,6 +1793,11 @@ def _caption_timeline(clip, transcript):
     return transcript, clip['start'], clip['end']
 
 
+def _caption_uses_ass(style):
+    return (style.get('style') == 'karaoke' or style.get('position_x') is not None
+            or style.get('position_y') is not None)
+
+
 def _write_caption_style(sub_path, transcript, start, end, style, split_ranges=None):
     """Write a caption file and return the options for burning it."""
     s = {k: SubtitleRequest.model_fields[k].default for k in CAPTION_STYLE_FIELDS}
@@ -1801,7 +1806,7 @@ def _write_caption_style(sub_path, transcript, start, end, style, split_ranges=N
                  if s["max_chars"] is not None else None)
     max_duration = (max(0.5, min(5.0, float(s["max_duration"])))
                     if s["max_duration"] is not None else None)
-    if s["style"] == "karaoke":
+    if _caption_uses_ass(s):
         opts = dict(
             split_ranges=split_ranges,
             alignment=s["position"], fontsize=s["font_size"],
@@ -1810,7 +1815,8 @@ def _write_caption_style(sub_path, transcript, start, end, style, split_ranges=N
             highlight_color=s["highlight_color"], bg_color=s["bg_color"],
             bg_opacity=s["bg_opacity"], effect=s["effect"],
             base_opacity=s["base_opacity"], uppercase=s["uppercase"],
-            reveal=s["reveal"], shadow=s["shadow"])
+            reveal=s["reveal"], shadow=s["shadow"],
+            position_x=s["position_x"], position_y=s["position_y"], plain=s["style"] != "karaoke")
         if max_chars is not None:
             opts["max_chars"] = max_chars
         if max_duration is not None:
@@ -1844,12 +1850,12 @@ def _restyle_captions(video_path, transcript, start, end, style,
     the clean file). Returns the captioned path, or None (no words, failure)."""
     output_dir = os.path.dirname(video_path)
     generation_id = int(time.time())
-    karaoke = (style or {}).get("style") == "karaoke"
+    use_ass = _caption_uses_ass(style or {})
     # Neutral name: the path goes inside an ffmpeg filter string, where an
     # apostrophe from a clip title would close the quote.
     sub_path = os.path.join(
         output_dir,
-        f"subs_restyle_{generation_id}_{uuid.uuid4().hex[:8]}.{'ass' if karaoke else 'srt'}")
+        f"subs_restyle_{generation_id}_{uuid.uuid4().hex[:8]}.{'ass' if use_ass else 'srt'}")
     out_path = os.path.join(
         output_dir, f"subtitled_{generation_id}_{os.path.basename(video_path)}")
     seams = layout_ranges.split_ranges(layout or layout_ranges.read(video_path))
@@ -6301,10 +6307,10 @@ async def process_endpoint(
     if n_clips is not None or min_secs is not None or max_secs is not None:
         print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs}")
 
-    # captions=false: the source already carries burned-in subtitles (or the
-    # caller adds its own later), so skip the free auto-caption pass instead
-    # of stacking a second layer. Absent → the deployment default (on).
-    if captions is not None and str(captions).lower() in ("0", "false", "no"):
+    # An explicit choice controls this job; omission keeps the deployment default.
+    if str(captions).lower() in ("1", "true", "yes"):
+        env["AUTO_CAPTIONS"] = "1"
+    elif str(captions).lower() in ("0", "false", "no"):
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
 
@@ -7451,6 +7457,8 @@ class SubtitleRequest(BaseModel):
     job_id: str
     clip_index: int
     position: str = "bottom" # top, middle, bottom
+    position_x: Optional[float] = Field(default=None, ge=10, le=90)
+    position_y: Optional[float] = Field(default=None, ge=8, le=92)
     font_size: int = 16
     font_name: str = "Verdana"
     font_color: str = "#FFFFFF"
@@ -7529,11 +7537,19 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
                 })
 
     duration_sec = clip_end - clip_start
+    if clip_data.get('caption_words'):
+        captions = [{"text": word['word'].strip(), "startMs": round(word['start'] * 1000),
+                     "endMs": round(word['end'] * 1000)} for word in clip_data['caption_words']]
+    style = clip_data.get('caption_style') or {}
 
     return {
         "captions": captions,
         "durationSec": duration_sec,
         "language": transcript.get('language', 'en'),
+        "position": style.get('position'),
+        "positionX": style.get('position_x'),
+        "positionY": style.get('position_y'),
+        "captionStyle": style,
     }
 
 
@@ -8478,7 +8494,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
     # would silently hand back a caption-less file.
     v_transcript = (recut.virtual_transcript(data.get('transcript') or {}, segments)
                     if req.reapply_captions else None)
-    if (preset or manual_presets) and v_transcript is not None:
+    if (preset or manual_presets or data.get('auto_captions') is False) and v_transcript is not None:
         current = os.path.basename((clip.get('video_url') or '').split('?')[0])
         if current and not watermarked.clean_name(current).startswith('subtitled_'):
             v_transcript = None
@@ -8894,7 +8910,8 @@ async def _add_subtitles_locked(req, request, job):
     caption_style = {k: getattr(req, k) for k in CAPTION_STYLE_FIELDS}
     clean_current = _strip_watermark_copy(output_dir, filename)
     if (req.style_only and req.words is None and req.input_filename is None
-            and clip_data.get('caption_style') == caption_style
+            and clip_data.get('caption_style')
+            and all(clip_data['caption_style'].get(k) == v for k, v in caption_style.items())
             and re.match(r'^subtitled_\d+_', clean_current)
             and os.path.isfile(os.path.join(output_dir, filename))):
         if not watermarked.hihuclip_enabled() or watermarked.is_marked(filename):
@@ -8913,8 +8930,8 @@ async def _add_subtitles_locked(req, request, job):
 
     # Define outputs
     generation_id = time.time_ns()
-    is_karaoke = req.style == "karaoke"
-    srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
+    use_ass = _caption_uses_ass(caption_style)
+    srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if use_ass else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
 
     # Style options shared by the karaoke ASS generator paths.
@@ -8931,7 +8948,8 @@ async def _add_subtitles_locked(req, request, job):
         border_width=req.border_width, highlight_color=req.highlight_color,
         bg_color=req.bg_color, bg_opacity=req.bg_opacity,
         effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
-        reveal=req.reveal, shadow=req.shadow,
+        reveal=req.reveal, shadow=req.shadow, position_x=req.position_x, position_y=req.position_y,
+        plain=req.style != 'karaoke',
     )
     if req.max_chars is not None:
         karaoke_opts["max_chars"] = max(1, min(40, int(req.max_chars)))
@@ -8967,7 +8985,7 @@ async def _add_subtitles_locked(req, request, job):
         if is_dubbed:
             print(f"🎙️ Dubbed video detected, transcribing audio for subtitles...")
             def run_transcribe_srt():
-                if is_karaoke:
+                if use_ass:
                     return generate_srt_from_video(input_path, srt_path, style="karaoke", **karaoke_opts)
                 return generate_srt_from_video(input_path, srt_path)
 
@@ -9065,7 +9083,12 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
     job = jobs[req.job_id]
     await _assert_job_owner(request, job)
     _check_editor_rate(await _owner_id(request))
+    lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
+    async with lock:
+        return await _remove_subtitles_locked(req, request, job)
 
+
+async def _remove_subtitles_locked(req, request, job):
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
@@ -9085,6 +9108,8 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
     # Same walk-back the burn path uses, so this undoes any number of restyles.
     filename = await asyncio.to_thread(_strip_burned_captions, output_dir, filename)
 
+    if re.match(r'^(?:wm_)?subtitled_\d+_', filename):
+        raise HTTPException(status_code=409, detail="The clip before subtitles is unavailable.")
     if not os.path.exists(os.path.join(output_dir, filename)):
         raise HTTPException(status_code=404,
                             detail="The original clip is no longer available.")
@@ -9210,7 +9235,7 @@ def _plan_hook_captions(source, hooked, clip, transcript):
     style = clip.get('caption_style')
     if style:
         stamp = time.time_ns()
-        ext = 'ass' if style.get('style') == 'karaoke' else 'srt'
+        ext = 'ass' if _caption_uses_ass(style) else 'srt'
         sub_path = os.path.join(directory, f"subs_hook_{stamp}.{ext}")
         options = _write_caption_style(sub_path, transcript, start, end, style, seams)
         if options is None:

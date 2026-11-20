@@ -226,6 +226,15 @@ class TestReframeRender:
         assert resp.status_code == 200
         assert fake_recut[0]["captions_transcript"] is None
 
+    def test_reframe_preserves_project_caption_opt_out(self, job, fake_recut):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["auto_captions"] = False
+        job["meta_path"].write_text(json.dumps(meta))
+        resp = _request("POST", "/api/clip/reframe", {
+            "job_id": JOB_ID, "clip_index": 0, "crop_overrides": {"0": 0.5}})
+        assert resp.status_code == 200
+        assert fake_recut[0]["captions_transcript"] is None
+
     def test_whole_clip_framing_carries_into_the_render(self, job, fake_recut):
         # recipe.framing='full' (the clip editor's selector) must keep forcing
         # WIDE on the scenes the user did not hand-position.

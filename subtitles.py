@@ -374,7 +374,8 @@ def line_width(font_name, final_fontsize, text):
     return (font.getlength(text) / 1000.0 * em + len(text) * bold) * final_fontsize
 
 
-def line_fitter(font_name, final_fontsize, uppercase=False, grow=0.0, padding=0.0):
+def line_fitter(font_name, final_fontsize, uppercase=False, grow=0.0, padding=0.0,
+                units=_LINE_UNITS):
     """fits(words) -> bool: do these words stay on one line of a 9:16 frame?
 
     ``grow`` is how much the active word swells (0.08 for the pop effect: the
@@ -382,7 +383,7 @@ def line_fitter(font_name, final_fontsize, uppercase=False, grow=0.0, padding=0.
     at both ends. None when the font cannot be measured."""
     if _font_metric(font_name) is None:
         return None
-    budget = _LINE_UNITS * 0.97 - 2 * padding
+    budget = max(1.0, units * 0.97 - 2 * padding)
 
     def fits(words):
         if len(words) < 2:
@@ -452,7 +453,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
                  highlight_color="#FFD700", bg_color="#000000", bg_opacity=0.0,
                  effect="none", base_opacity=1.0, uppercase=False,
                  margin_v=SAFE_MARGIN_V, split_ranges=None,
-                 reveal=False, shadow=0):
+                 reveal=False, shadow=0, position_x=None, position_y=None, plain=False):
     """
     Generates a karaoke-style ASS file: each block is shown like the SRT path,
     but the currently spoken word is rendered in highlight_color (modern
@@ -479,6 +480,15 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
 
     align_map = {'top': 8, 'middle': 5, 'bottom': 2}
     ass_alignment = align_map.get(str(alignment).lower(), 2)
+    custom = position_x is not None or position_y is not None
+    anchor = ''
+    units = _LINE_UNITS
+    if custom:
+        x = _clamp_number(position_x, 10, 90, 50)
+        default_y = {8: 12, 5: 50, 2: 85}[ass_alignment]
+        y = _clamp_number(position_y, 8, 92, default_y)
+        anchor = f'{{\\an5\\pos({162 * x / 100:.2f},{288 * y / 100:.2f})}}'
+        units = min(_LINE_UNITS, 162 * (2 * min(x, 100 - x) - 4) / 100)
 
     # On a SPLIT scene the two speakers are stacked and the seam between the
     # halves (exactly mid-frame) is the one place the text covers nobody, so
@@ -491,7 +501,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     seam_ranges = [(float(a), float(b)) for a, b in (split_ranges or [])]
 
     def seam_prefix(t):
-        return "{\\an5}" if any(a <= t < b for a, b in seam_ranges) else ""
+        return anchor or ("{\\an5}" if any(a <= t < b for a, b in seam_ranges) else "")
 
     safe_font = _sanitize_font_name(font_name)
     base_opacity = _clamp_number(base_opacity, 0.05, 1.0, 1.0)
@@ -521,9 +531,9 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     # text is the active word's own border: glow and box thicken it.
     edge = {"glow": max(3, int(outline_width) + 2), "box": max(4, int(outline_width) + 3),
             "highlight": max(2, round(final_fontsize * 0.12))}.get(effect, int(outline_width))
-    fits = None if max_chars == 1 else line_fitter(
+    fits = None if max_chars == 1 and not custom else line_fitter(
         font_name, final_fontsize, uppercase=uppercase,
-        grow=0.08 if effect == "pop" else 0.0, padding=edge + shadow)
+        grow=0.08 if effect == "pop" else 0.0, padding=edge + shadow, units=units)
     blocks = _collect_word_blocks(transcript, clip_start, clip_end, max_chars, max_duration,
                                   fits=fits)
     if not blocks:
@@ -569,6 +579,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
+        + ("PlayResX: 162\n" if custom else "") +
         "PlayResY: 288\n"
         # Measured blocks never need wrapping, so it is switched off for them:
         # a rounding difference must not bring the two-line jump back.
@@ -598,8 +609,16 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
             lone = _escape_ass_text(block[0]['word'])
             wide = line_width(font_name, final_fontsize, lone.upper() if uppercase else lone)
             if wide > fits.budget:
-                pct = max(40, int(100 * fits.budget / wide))
-                squeeze = f"{{\\c{highlight_inline}\\fscx{pct}\\fscy{pct}}}"
+                pct = max(5 if custom else 40, int(100 * fits.budget / wide))
+                color = '' if plain else f'\\c{highlight_inline}'
+                squeeze = f"{{{color}\\fscx{pct}\\fscy{pct}}}"
+        if plain:
+            text = ' '.join(_escape_ass_text(word['word']) for word in block)
+            events.append(
+                f"Dialogue: 0,{_ass_time(block[0]['start'])},{_ass_time(block[-1]['end'])},Default,,0,0,0,,"
+                f"{seam_prefix(block[0]['start'])}{squeeze}{text}"
+            )
+            continue
         for i, word in enumerate(block):
             # Event runs until the next word starts (no flicker in gaps);
             # the last word holds until the block ends.

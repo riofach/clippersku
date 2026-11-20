@@ -57,6 +57,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [autoHook, setAutoHook] = useState(() => {
         try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
     });
+    const [autoCaptions, setAutoCaptions] = useState(() => {
+        try { return localStorage.getItem('os_auto_captions') !== '0'; } catch { return true; }
+    });
     const [autoHookStyle, setAutoHookStyle] = useState(() => {
         // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
         try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
@@ -128,6 +131,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
             autoHook,
+            autoCaptions,
             autoHookStyle,
             layout,
             sourceStart: range ? Math.round(range.start) : null,
@@ -135,6 +139,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
+            localStorage.setItem('os_auto_captions', autoCaptions ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
         } catch { /* ignore */ }
@@ -344,7 +349,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     type="number" min="5" max="175" step="1"
                                     value={clipMinSeconds}
                                     onChange={(e) => setClipMinSeconds(e.target.value)}
-                                    placeholder="15"
+                                    placeholder={layout === 'gaming' ? '25' : '15'}
                                     className="input-field"
                                 />
                             </div>
@@ -354,7 +359,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     type="number" min="10" max="180" step="1"
                                     value={clipMaxSeconds}
                                     onChange={(e) => setClipMaxSeconds(e.target.value)}
-                                    placeholder="60"
+                                    placeholder={layout === 'gaming' ? '75' : '60'}
                                     className="input-field"
                                 />
                             </div>
@@ -400,7 +405,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                         onChange={(e) => setAutoHook(e.target.checked)}
                                         className="w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
                                     />
-                                    auto hook titles on clips
+                                    auto hook titles with intro blur
                                 </label>
                                 {autoHook && (
                                     <select
@@ -427,6 +432,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         </div>
                     )}
                 </div>
+
+                <label className="mt-5 flex items-center gap-2.5 text-sm text-ink2 cursor-pointer select-none">
+                    <input type="checkbox" checked={autoCaptions}
+                        onChange={(e) => setAutoCaptions(e.target.checked)}
+                        className="w-4 h-4 shrink-0 accent-[var(--color-accent)]" />
+                    Auto captions
+                </label>
 
                 <label className="flex items-start gap-2.5 mt-5 text-left text-[13px] sm:text-xs leading-relaxed text-muted cursor-pointer select-none">
                     <input

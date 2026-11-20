@@ -35,6 +35,8 @@ export interface SubtitleStyle {
 export interface SubtitleConfig {
   captions: CaptionWord[];
   position: SubtitlePosition;
+  positionX?: number;
+  positionY?: number;
   style: SubtitleStyle;
   // Line budget, mirrors the burn's max_chars / max_duration.
   maxChars?: number;
@@ -120,6 +122,8 @@ export const subtitleStyleSchema = z.object({
 export const subtitleConfigSchema = z.object({
   captions: z.array(captionWordSchema),
   position: z.enum(["top", "middle", "bottom"]),
+  positionX: z.number().optional(),
+  positionY: z.number().optional(),
   style: subtitleStyleSchema,
 });
 

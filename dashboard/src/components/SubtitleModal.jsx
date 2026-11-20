@@ -116,10 +116,13 @@ const swatchClass = (selected) =>
         ? 'ring-2 ring-[color:var(--color-accent)] ring-offset-2 ring-offset-[color:var(--color-paper-2)]'
         : 'ring-1 ring-[color:var(--color-rule-2)] hover:ring-[color:var(--color-accent)]'}`;
 
-export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, savedFontSize, bulkCount = 0, bulkProgress }) {
+const PRESET_Y = { top: 12, middle: 50, bottom: 85 };
+
+export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, onRemoveAll, isProcessing, videoUrl, jobId, clipIndex, existingHook, savedFontSize, bulkCount = 0, bulkProgress }) {
     // Opens on the look the clip already has (the Default preset), so
     // "apply" without touching anything changes nothing.
     const [position, setPosition] = useState('bottom');
+    const [coordinates, setCoordinates] = useState(null);
     const [fontSize, setFontSize] = useState(() => Math.max(10, Math.min(200, savedFontSize ?? 40)));
     const [fontName, setFontName] = useState('Anton');
     const [fontColor, setFontColor] = useState('#FFFFFF');
@@ -215,6 +218,28 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         apiFetch(`/api/clip/${jobId}/${clipIndex}/transcript`)
             .then((res) => res.ok ? res.json() : null)
             .then((data) => {
+                if (data) {
+                    if (data.position) setPosition(data.position);
+                    setCoordinates(data.positionX == null && data.positionY == null ? null : {
+                        x: data.positionX ?? 50, y: data.positionY ?? PRESET_Y[data.position || 'bottom'],
+                    });
+                    const saved = data.captionStyle;
+                    if (saved?.style) {
+                        setStyle(saved.style);
+                        setAnimationState(EFFECT_TO_ANIMATION[saved.effect] || 'none');
+                        const fields = [
+                            ['font_size', setFontSize], ['font_name', setFontName], ['font_color', setFontColor],
+                            ['border_color', setBorderColor], ['border_width', setBorderWidth],
+                            ['bg_color', setBgColor], ['bg_opacity', setBgOpacity], ['highlight_color', setHighlightColor],
+                            ['effect', setEffect], ['base_opacity', setBaseOpacity], ['uppercase', setUppercase],
+                            ['reveal', setReveal], ['shadow', setShadow],
+                        ];
+                        for (const [key, update] of fields) {
+                            if (saved[key] != null) update(saved[key]);
+                        }
+                        setOneWord(saved.max_chars === 1);
+                    }
+                }
                 if (data && data.captions && data.captions.length > 0) {
                     setCaptions(data.captions);
                     setOriginalCaptions(data.captions);
@@ -254,11 +279,15 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     if (!isOpen) return null;
     const resolvedVideo = jobId && clipIndex !== undefined ? previewVideo : videoUrl;
     const loadingPreview = captionsLoading || (jobId && clipIndex !== undefined && !resolvedVideo && !previewError);
+    const displayCoordinates = coordinates ?? { x: 50, y: PRESET_Y[position] ?? 85 };
+    const setAxis = (axis, value) => setCoordinates({ ...displayCoordinates, [axis]: value });
 
     // Build subtitle config for Remotion
     const subtitleConfig = {
         captions,
         position,
+        positionX: coordinates?.x,
+        positionY: coordinates?.y,
         maxChars,
         maxDurationMs: maxDuration * 1000,
         style: {
@@ -340,10 +369,13 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                     ) : (
                         <>
                             <video src={resolvedVideo} className="w-full h-full object-contain opacity-50" controls muted playsInline />
-                            <div className={`absolute w-full px-8 text-center transition-all duration-300 pointer-events-none flex flex-col items-center justify-center
-                                ${position === 'top' ? 'top-20' : ''}
-                                ${position === 'middle' ? 'top-0 bottom-0' : ''}
-                                ${position === 'bottom' ? 'bottom-20' : ''}
+                            <div style={coordinates ? { left: `${coordinates.x}%`, top: `${coordinates.y}%`,
+                                width: `${Math.min(85, 2 * Math.min(coordinates.x, 100 - coordinates.x) - 4)}%`,
+                                transform: 'translate(-50%, -50%)' } : undefined}
+                                className={`absolute w-full text-center pointer-events-none flex flex-col items-center justify-center
+                                ${coordinates ? '' : {
+                                    top: 'px-8 top-20', middle: 'px-8 top-0 bottom-0', bottom: 'px-8 bottom-20',
+                                }[position]}
                             `}>
                                 <span style={fallbackPreviewStyle}>
                                     This is how your subtitles<br/>will appear on the video
@@ -408,9 +440,19 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             <SegmentedControl
                                 options={POSITION_OPTIONS}
                                 value={position}
-                                onChange={setPosition}
+                                onChange={(value) => { setPosition(value); setCoordinates(null); }}
                                 size="sm"
                             />
+                            <div className="mt-3 space-y-2">
+                                {[['x', 'X · Left / right', 10, 90], ['y', 'Y · Top / bottom', 8, 92]].map(([axis, label, min, max]) => (
+                                    <label key={axis} className="block text-xs text-muted">
+                                        <span className="flex justify-between gap-3"><span>{label}</span><span>{displayCoordinates[axis]}%</span></span>
+                                        <input type="range" aria-label={label} min={min} max={max} step={1}
+                                            value={displayCoordinates[axis]} onChange={(e) => setAxis(axis, e.target.valueAsNumber)}
+                                            className="w-full accent-[var(--color-accent)]" />
+                                    </label>
+                                ))}
+                            </div>
                         </div>
 
                         {/* Size */}
@@ -607,6 +649,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                 && editableText.trim() !== originalCaptions.map((c) => c.text).join(' ').trim();
                             const styleOptions = {
                                 position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity,
+                                positionX: coordinates?.x ?? null, positionY: coordinates?.y ?? null,
                                 // Karaoke burn (server-side ASS render)
                                 style, effect, baseOpacity, uppercase, highlightColor,
                                 reveal: !oneWord && reveal, shadow, maxChars, maxDuration,
@@ -636,7 +679,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                             disabled={isProcessing}
                                             className="btn-ghost w-full flex items-center justify-center gap-2"
                                         >
-                                            {bulkRunning
+                                            {bulkRunning && bulkProgress.action === 'apply'
                                                 ? <><Loader2 size={16} className="animate-spin" />applying to all… {bulkProgress.current}/{bulkProgress.total}</>
                                                 : `apply this style to all ${bulkCount} clips`}
                                         </button>
@@ -652,6 +695,19 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                         >
                                             remove captions from this clip
                                         </button>
+                                    )}
+                                    {onRemoveAll && bulkCount > 1 && (
+                                        <button onClick={onRemoveAll} disabled={isProcessing}
+                                            className="block text-xs text-muted underline underline-offset-2 lowercase hover:text-ink2 disabled:opacity-50">
+                                            {bulkRunning && bulkProgress.action === 'remove'
+                                                ? `removing from all… ${bulkProgress.current}/${bulkProgress.total}`
+                                                : `remove captions from all ${bulkCount} clips`}
+                                        </button>
+                                    )}
+                                    {!bulkRunning && bulkProgress?.errors > 0 && (
+                                        <p role="status" className="text-xs text-warn">
+                                            Could not update {bulkProgress.errors} of {bulkProgress.total} clips.
+                                        </p>
                                     )}
                                 </>
                             );

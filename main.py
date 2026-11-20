@@ -32,7 +32,7 @@ import layout_picker
 import llm_backend
 import yt_account
 import twitch_signals
-from clip_selection import (build_transcript_windows, clip_count_targets,
+from clip_selection import (build_transcript_windows, clip_count_targets, gaming_story_range,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
@@ -1466,6 +1466,11 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         return None
 
 
+def _auto_hook_text(clip):
+    return ((clip.get('viral_hook_text') or '').strip()
+            or (clip.get('video_title_for_youtube_short') or '').strip())
+
+
 def auto_hook_clip(clip_path, clip, captions=None, mark=False):
     """Burn the clip's Gemini hook text as a DERIVED file (AUTO_HOOK=1).
 
@@ -1488,7 +1493,7 @@ def auto_hook_clip(clip_path, clip, captions=None, mark=False):
     ``mark`` (free plan, only with ``captions``): the same ffmpeg also writes
     the served ``wm_`` copy of the captioned file, so mark_delivery finds it
     made instead of decoding the captioned file again for its own pass."""
-    text = (clip.get('viral_hook_text') or '').strip()
+    text = _auto_hook_text(clip)
     if not text:
         return None
     style = os.environ.get("AUTO_HOOK_STYLE", "pill")
@@ -1506,9 +1511,9 @@ def auto_hook_clip(clip_path, clip, captions=None, mark=False):
         # "auto": off the speaker's face and off the captions (hook_placement);
         # the layout ranges say where the captions sit (the seam on SPLIT).
         config = {"text": text, "style": style, "position": "auto",
-                  "duration_seconds": seconds}
+                  "duration_seconds": seconds, "intro_blur": True}
         place = {"position": "auto", "layout_ranges": clip.get('layout_ranges'),
-                 "has_captions": bool(captions)}
+                 "has_captions": bool(captions), "intro_blur": True}
 
         def note(result):
             if isinstance(result, dict) and result.get("y") is not None:
@@ -1574,7 +1579,7 @@ def pro_clip(clip_path, clip, transcript):
         wait = 120.0
     import subtitles as _subs
     hook_seconds = 0.0
-    if os.environ.get("AUTO_HOOK") == "1" and (clip.get('viral_hook_text') or '').strip():
+    if os.environ.get("AUTO_HOOK") == "1" and _auto_hook_text(clip):
         try:
             hook_seconds = float(os.environ.get("AUTO_HOOK_SECONDS", "5"))
         except ValueError:
@@ -2341,6 +2346,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
     that hold them, and the hottest windows are guaranteed a shortlist slot.
     """
     language = str(transcript_result.get('language') or 'unknown')
+    gaming = os.getenv('CLIP_LAYOUT_PRESET') == 'gaming'
     if llm_backend.active():
         # Self-hosted text model: no Google key needed for this stage.
         client = None
@@ -2368,7 +2374,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         # prompt keeps clips inside their candidate window), so scale them with
         # the requested band — a user asking for 60-90s clips on the default
         # 90s windows would get clips squeezed against the window walls.
-        min_secs, max_secs = clip_duration_bounds()
+        min_secs, max_secs = clip_duration_bounds(gaming=gaming)
         windows = build_transcript_windows(
             transcript_result, video_duration,
             window_seconds=max(90, int(max_secs * 1.5)))
@@ -2404,9 +2410,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             return out
 
         def _score_prompt(ws):
-            return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+            prompt = gemini_worker.SCORE_PROMPT_TEMPLATE.format(
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+            if gaming:
+                prompt += '\nFor gaming, prefer windows with a setup, an identifiable action, and its immediate outcome. Penalize reactions without context.'
+            return prompt
 
         for batch in score_batches(windows, SCORE_BATCH):
             scored.extend(_run_stage_split(
@@ -2436,11 +2445,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             # A split batch keeps the full clip-count band: a short list can
             # still hold the best clips, and the model returns fewer anyway.
             def build(ws):
-                return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+                prompt = gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
                     video_duration=video_duration, language=language,
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+                return prompt + (gemini_worker.GAMING_STORY_RULES if gaming else '')
             return build
 
         shorts = _run_stage_split(client, model_name, shortlist,
@@ -2483,8 +2493,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             # measured (distance to the nearest word before the snap; p90 was
             # 0.4-0.5 s on 8 talks, 21-sep-2026, so the snap reaches it).
             s["proposed"] = [s.get("start", 0), s.get("end", 0)]
-            ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
-                                        min_duration=min_secs, max_duration=max_secs)
+            if gaming:
+                # Preserve the visual handles even in the silence between words.
+                ns, ne = gaming_story_range(s, video_duration, min_secs, max_secs)
+            else:
+                ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
+                                            min_duration=min_secs, max_duration=max_secs)
             s["start"], s["end"] = ns, ne
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):
@@ -2686,7 +2700,9 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
             return default
     v_min_clips = _env_int("CLIP_TARGET_MIN", 3)
     v_max_clips = max(v_min_clips, _env_int("CLIP_TARGET_MAX", 15))
-    v_min_secs, v_max_secs = clip_duration_bounds()
+    gaming = os.getenv('CLIP_LAYOUT_PRESET') == 'gaming'
+    v_min_secs, v_max_secs = clip_duration_bounds(gaming=gaming)
+    gaming_hint = gemini_worker.GAMING_STORY_RULES if gaming else ''
 
     segments = vision_segments(video_duration, VISION_SEGMENT_SECONDS, VISION_MAX_SEGMENTS)
     try:
@@ -2713,7 +2729,7 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
                     shorts, cost = _visual_pass(
                         client, model_name, proxy, round(s1 - s0, 3), language,
                         per_min, v_max_clips, v_min_secs, v_max_secs,
-                        hint=_viewer_hint(viewer_clips, s0, s1 - s0))
+                        hint=(_viewer_hint(viewer_clips, s0, s1 - s0) or '') + gaming_hint)
                 except gemini_worker.GeminiBlockedError:
                     raise
                 except Exception as e:
@@ -2727,6 +2743,11 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
                 for sh in shorts or []:
                     sh["start"] = round(sh["start"] + s0, 3)
                     sh["end"] = round(min(float(video_duration), sh["end"] + s0), 3)
+                    if gaming:
+                        for key in ('event_start', 'event_end'):
+                            if isinstance(sh.get(key), (int, float)):
+                                sh[key] += s0
+                        sh['start'], sh['end'] = gaming_story_range(sh, video_duration, v_min_secs, v_max_secs)
                     clean.append(sh)
                 print(f"   stretch {i + 1}/{len(segments)}: {len(shorts or [])} pick(s)")
         finally:
@@ -3108,6 +3129,8 @@ if __name__ == '__main__':
             clips_data['output_format'] = output_format
             if layout_preset:
                 clips_data['layout_preset'] = layout_preset
+            if os.environ.get("AUTO_CAPTIONS", "1").strip() == "0":
+                clips_data['auto_captions'] = False
             if source_subtitle_band:
                 clips_data['source_subtitle_band'] = source_subtitle_band
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
@@ -3183,7 +3206,7 @@ if __name__ == '__main__':
                         # Captions ride the hook's ffmpeg (one decode, two
                         # outputs) when both are on; see auto_hook_clip.
                         plan = None
-                        if (clip.get('viral_hook_text') or '').strip():
+                        if _auto_hook_text(clip):
                             plan = auto_caption_clip(base_path, words, w_start, w_end,
                                                      split_ranges=split_ranges, plan_only=True,
                                                      style=cap_style)
