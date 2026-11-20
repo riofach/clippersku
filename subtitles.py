@@ -783,7 +783,7 @@ def _video_size(path):
 def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
                    font_name="Verdana", font_color="#FFFFFF",
                    border_color="#000000", border_width=2,
-                   bg_color="#000000", bg_opacity=0.0, mark=None):
+                   bg_color="#000000", bg_opacity=0.0, mark=None, quality=QUALITY):
     """
     Burns subtitles into the video using FFmpeg.
     Supports two modes:
@@ -800,7 +800,15 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
                           border_color=border_color, border_width=border_width,
                           bg_color=bg_color, bg_opacity=bg_opacity)
 
-    tail = ['-c:a', 'copy', *video_encode_args(QUALITY), *METADATA_SCRUB,
+    if not mark and not os.path.isfile(video_path):
+        import hooks
+        directory, name = os.path.split(video_path)
+        if hooks.has_recipe(directory, name):
+            if hooks.render_recipe(video_path, output_path, extra_filter=vf, quality=quality):
+                return True
+            raise RuntimeError("Could not render subtitles over the saved hook.")
+
+    tail = ['-c:a', 'copy', *video_encode_args(quality), *METADATA_SCRUB,
             '-movflags', '+faststart']
     outputs = [output_path]
     size = _video_size(video_path) if mark else None

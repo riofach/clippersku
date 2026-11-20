@@ -176,6 +176,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const [captionsLoading, setCaptionsLoading] = useState(false);
     const [useRemotionPreview, setUseRemotionPreview] = useState(false);
     const [previewVideo, setPreviewVideo] = useState(null);
+    const [previewHook, setPreviewHook] = useState(null);
     const [previewError, setPreviewError] = useState('');
     const [fallbackFailed, setFallbackFailed] = useState(false);
 
@@ -183,10 +184,23 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         if (!isOpen || !jobId || clipIndex === undefined) return;
         const controller = new AbortController();
         setPreviewVideo(null);
+        setPreviewHook(null);
         setPreviewError('');
         setFallbackFailed(false);
         apiJson(`/api/clip/${jobId}/${clipIndex}/subtitle-preview`, { signal: controller.signal })
-            .then(({ video_url }) => setPreviewVideo(getApiUrl(video_url)))
+            .then(({ video_url, hook }) => {
+                setPreviewVideo(getApiUrl(video_url));
+                if (hook?.text) setPreviewHook({
+                    text: hook.text,
+                    font: hook.font,
+                    size: hook.size || 'M',
+                    style: hook.style || 'pill',
+                    position: hook.position || 'top',
+                    entranceAnimation: 'none',
+                    displayDurationSec: hook.duration_seconds,
+                    introBlur: hook.intro_blur ?? false,
+                });
+            })
             .catch((error) => {
                 if (!controller.signal.aborted) setPreviewError(error.detail || 'Could not load the editable video.');
             });
@@ -319,7 +333,9 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             videoUrl={resolvedVideo}
                             durationInSeconds={durationSec}
                             subtitles={subtitleConfig}
-                            hook={existingHook || null}
+                            hook={existingHook || (previewHook && {
+                                ...previewHook, displayDurationSec: previewHook.displayDurationSec ?? durationSec,
+                            })}
                         />
                     ) : (
                         <>

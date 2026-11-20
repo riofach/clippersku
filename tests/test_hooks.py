@@ -176,3 +176,33 @@ def test_intro_blur_fades_out_under_the_hook(tmp_path):
     clear = edge_sample(2.75)
     assert blurred > fading > clear
     assert blurred > 60 and clear < 10
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="needs FFmpeg")
+def test_restyle_renders_saved_hook_and_subtitles_without_an_intermediate_video(tmp_path, monkeypatch):
+    import hooks
+    from subtitles import burn_subtitles, subtitles_filter
+
+    monkeypatch.setattr(hooks, "LAZY", True)
+    source = tmp_path / "base.mp4"
+    hooked = tmp_path / "hooked_1_base.mp4"
+    captioned = tmp_path / "subtitled_2_hooked_1_base.mp4"
+    styled = tmp_path / "subtitled_3_hooked_1_base.mp4"
+    track = tmp_path / "words.srt"
+    track.write_text("1\n00:00:00,000 --> 00:00:02,900\nDialogue\n", encoding="utf-8")
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=blue:s=160x240:r=10:d=3",
+        "-f", "lavfi", "-i", "sine=d=3", "-c:v", "libx264", "-c:a", "aac", str(source),
+    ], check=True, timeout=30)
+
+    add_hook_to_video(str(source), "TITLE", str(hooked), duration=2, intro_blur=True,
+                      also=(subtitles_filter(str(track)), str(captioned)))
+    assert captioned.is_file()
+    assert hooks.has_recipe(tmp_path, hooked.name) and not hooked.exists()
+    assert burn_subtitles(str(hooked), str(track), str(styled), fontsize=32)
+    assert not hooked.exists()
+    streams = subprocess.check_output([
+        "ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(styled),
+    ], text=True, timeout=10)
+    assert set(streams.splitlines()) == {"video", "audio"}

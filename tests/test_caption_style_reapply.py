@@ -5,6 +5,7 @@ top (_reapply_captions). They used to burn the default look, so adding a hook
 swapped the user's captions for big yellow Anton (github issue #82).
 /api/subtitle now records the look on the clip and the re-burn uses it.
 """
+import asyncio
 import json
 import os
 
@@ -123,3 +124,37 @@ def test_restyle_names_the_output_like_auto_captions(tmp_path, monkeypatch):
 def test_recut_captioner_only_with_a_recorded_style():
     assert app_module._recut_captioner({}) is None
     assert callable(app_module._recut_captioner({"caption_style": STYLE}))
+
+
+def test_bulk_style_reuses_same_export_and_preserves_edited_words_on_change(tmp_path, monkeypatch):
+    job_id = "job1"
+    request = app_module.SubtitleRequest(job_id=job_id, clip_index=0, style_only=True, **STYLE)
+    recorded = {key: getattr(request, key) for key in app_module.CAPTION_STYLE_FIELDS}
+    words = [{"word": " edited", "start": 0.1, "end": 0.9}]
+    captioned = "subtitled_12_base_clip_1.mp4"
+    clip = {
+        "start": 10.0, "end": 12.0, "caption_style": recorded, "caption_words": words,
+        "video_url": f"/videos/{job_id}/{captioned}",
+    }
+    _job(tmp_path, monkeypatch, clip)
+    directory = tmp_path / job_id
+    for name in (captioned, "base_clip_1.mp4"):
+        (directory / name).write_bytes(b"video")
+    monkeypatch.setattr(app_module, "BILLING_ENABLED", False)
+    monkeypatch.setenv("HIHUCLIP_WATERMARK", "0")
+    renders = []
+
+    def burn(video, out_path, sub_path, transcript, *args, **kwargs):
+        renders.append(transcript)
+        return True
+
+    monkeypatch.setattr(app_module, "_burn_caption_style", burn)
+    job = {"result": {"clips": [dict(clip)]}}
+    unchanged = asyncio.run(app_module._add_subtitles_locked(request, None, job))
+    assert unchanged["reused"] is True and not renders
+
+    revised = request.model_copy(update={"font_size": 32})
+    asyncio.run(app_module._add_subtitles_locked(revised, None, job))
+    assert renders[0]["segments"][0]["words"] == words
+    saved = json.loads((directory / "base_metadata.json").read_text())["shorts"][0]
+    assert saved["caption_words"] == words and saved["caption_style"]["font_size"] == 32

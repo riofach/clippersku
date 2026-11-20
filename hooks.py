@@ -491,7 +491,7 @@ def _auto_place(video_path, text, target_box_width, hook_filename, font_scale, s
 
 def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0, duration=None, style="pill",
                       also=None, font=None, layout_ranges=None, has_captions=True,
-                      mark=None, intro_blur=False):
+                      mark=None, intro_blur=False, quality=QUALITY):
     """
     Overlays text hook onto video.
     position: 'top', 'center', 'bottom', or 'auto' (hook_placement: off the
@@ -578,7 +578,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         
         blur_sigma = min(64, video_width * INTRO_BLUR_SIGMA_RATIO) if intro_blur else 0
         overlay = _overlay_graph(overlay_x, overlay_y, duration, blur_sigma)
-        tail = _encode_tail()
+        tail = _encode_tail(quality)
         lazy = also is not None and LAZY
         hooked_out = [] if lazy else ['-map', '[h]', '-map', '0:a?', *tail, output_path]
         if also and mark:
@@ -611,7 +611,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
                 '-map', '[s]', '-map', '0:a?', *tail, extra_path,
             ]
         else:
-            ffmpeg_cmd = _overlay_cmd(video_path, img_path, overlay, output_path)
+            ffmpeg_cmd = _overlay_cmd(video_path, img_path, overlay, output_path, quality)
 
         outputs = [] if lazy else [output_path]
         if also:
@@ -629,7 +629,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             except Exception as e:
                 # No recipe, no on-demand file: encode the hooked picture now.
                 print(f"⚠️ Hook recipe not kept ({e}); encoding {output_path} now")
-                cmd = _overlay_cmd(video_path, img_path, overlay, output_path)
+                cmd = _overlay_cmd(video_path, img_path, overlay, output_path, quality)
                 done = _run_encode(cmd, video_path, [output_path])
                 if done.returncode != 0 and not finished_before_crash(done, [output_path]):
                     raise subprocess.CalledProcessError(done.returncode, cmd,
@@ -676,14 +676,14 @@ def _overlay_graph(x, y, duration, blur_sigma=0):
             + (f":enable='between(t,0,{float(duration)})'" if duration else ""))
 
 
-def _encode_tail():
-    return ['-c:a', 'copy', *video_encode_args(QUALITY), *METADATA_SCRUB,
+def _encode_tail(quality=QUALITY):
+    return ['-c:a', 'copy', *video_encode_args(quality), *METADATA_SCRUB,
             '-movflags', '+faststart']
 
 
-def _overlay_cmd(video_path, img_path, overlay, output_path):
+def _overlay_cmd(video_path, img_path, overlay, output_path, quality=QUALITY):
     return ['ffmpeg', '-y', '-i', video_path, '-i', img_path,
-            '-filter_complex', overlay, *_encode_tail(), output_path]
+            '-filter_complex', overlay, *_encode_tail(quality), output_path]
 
 
 def _run_encode(cmd, video_path, outputs):
@@ -718,14 +718,9 @@ def _write_recipe(output_path, video_path, img_path, x, y, duration, blur_sigma=
                    "duration": duration, "blur_sigma": blur_sigma}, f)
 
 
-def materialize(output_dir, hooked_name):
-    """Encode ``hooked_name`` from its recipe if it is not on disk yet.
-
-    True when the file exists afterwards. Safe to call concurrently: each
-    call encodes to its own temporary name and renames it into place."""
-    path = os.path.join(output_dir, hooked_name)
-    if os.path.exists(path):
-        return True
+def render_recipe(hooked_path, output_path, *, extra_filter=None, quality=QUALITY):
+    """Render a stored hook, optionally with captions in the same pass."""
+    output_dir, hooked_name = os.path.split(hooked_path)
     json_path, png_path = recipe_paths(output_dir, hooked_name)
     try:
         with open(json_path) as f:
@@ -746,11 +741,22 @@ def materialize(output_dir, hooked_name):
     if not (-20000 <= x <= 20000 and -20000 <= y <= 20000 and 0 <= blur_sigma <= 64) or (
             duration is not None and not 0 < duration < 86400):
         return False
+    overlay = _overlay_graph(x, y, duration, blur_sigma)
+    if extra_filter:
+        overlay = f"{overlay},{extra_filter}"
+    cmd = _overlay_cmd(source, png_path, overlay, output_path, quality)
+    result = _run_encode(cmd, source, [output_path])
+    return result.returncode == 0 or finished_before_crash(result, [output_path])
+
+
+def materialize(output_dir, hooked_name):
+    """Encode ``hooked_name`` on demand, publishing it atomically."""
+    path = os.path.join(output_dir, hooked_name)
+    if os.path.exists(path):
+        return True
     tmp = os.path.join(output_dir, f".part_{uuid.uuid4().hex[:8]}_{hooked_name}")
-    cmd = _overlay_cmd(source, png_path, _overlay_graph(x, y, duration, blur_sigma), tmp)
     try:
-        result = _run_encode(cmd, source, [tmp])
-        if result.returncode != 0 and not finished_before_crash(result, [tmp]):
+        if not render_recipe(path, tmp):
             print(f"⚠️ Could not encode {hooked_name} from its recipe")
             return False
         os.replace(tmp, path)

@@ -1743,19 +1743,7 @@ def _reapply_captions(job_id, clip_index, video_path):
         if not transcript or clip_index >= len(clips):
             return None
         clip = clips[clip_index]
-        # A recut clip is a concatenation of source segments, so the flat
-        # start..end window is wrong for it — caption against the clip-relative
-        # remapped transcript instead (same trick /api/subtitle uses).
-        recipe_segments = (clip.get('recipe') or {}).get('segments')
-        if recipe_segments:
-            transcript = recut.virtual_transcript(transcript, recipe_segments)
-            start, end = 0.0, recut.total_duration(recipe_segments)
-        else:
-            start, end = clip['start'], clip['end']
-        if clip.get('caption_words'):
-            transcript = _words_transcript(clip['caption_words'],
-                                           transcript.get('language', 'en'))
-            start, end = 0.0, transcript['segments'][0]['end']
+        transcript, start, end = _caption_timeline(clip, transcript)
         if clip.get('caption_style'):
             return _restyle_captions(video_path, transcript, start, end,
                                      clip['caption_style'],
@@ -1795,11 +1783,18 @@ def _words_transcript(words, language="en"):
     }
 
 
-def _burn_caption_style(video_path, out_path, sub_path, transcript, start, end,
-                        style, split_ranges=None):
-    """Generate the caption file for ``style`` (CAPTION_STYLE_FIELDS, a
-    missing field takes the SubtitleRequest default) and burn it onto
-    ``video_path``. Returns False when no words fall in the range."""
+def _caption_timeline(clip, transcript):
+    if clip.get('caption_words'):
+        edited = _words_transcript(clip['caption_words'], transcript.get('language', 'en'))
+        return edited, 0.0, edited['segments'][0]['end']
+    segments = (clip.get('recipe') or {}).get('segments')
+    if segments:
+        return recut.virtual_transcript(transcript, segments), 0.0, recut.total_duration(segments)
+    return transcript, clip['start'], clip['end']
+
+
+def _write_caption_style(sub_path, transcript, start, end, style, split_ranges=None):
+    """Write a caption file and return the options for burning it."""
     s = {k: SubtitleRequest.model_fields[k].default for k in CAPTION_STYLE_FIELDS}
     s.update({k: v for k, v in (style or {}).items() if k in s})
     max_chars = (max(1, min(40, int(s["max_chars"])))
@@ -1825,12 +1820,20 @@ def _burn_caption_style(video_path, out_path, sub_path, transcript, start, end,
         ok = generate_srt(transcript, start, end, sub_path,
                           max_chars or 20, max_duration or 2.0)
     if not ok:
+        return None
+    return dict(alignment=s["position"], fontsize=s["font_size"],
+                font_name=s["font_name"], font_color=s["font_color"],
+                border_color=s["border_color"], border_width=s["border_width"],
+                bg_color=s["bg_color"], bg_opacity=s["bg_opacity"])
+
+
+def _burn_caption_style(video_path, out_path, sub_path, transcript, start, end,
+                        style, split_ranges=None, *, quality=None):
+    options = _write_caption_style(sub_path, transcript, start, end, style, split_ranges)
+    if options is None:
         return False
-    burn_subtitles(video_path, sub_path, out_path,
-                   alignment=s["position"], fontsize=s["font_size"],
-                   font_name=s["font_name"], font_color=s["font_color"],
-                   border_color=s["border_color"], border_width=s["border_width"],
-                   bg_color=s["bg_color"], bg_opacity=s["bg_opacity"])
+    burn_subtitles(video_path, sub_path, out_path, **options,
+                   **({"quality": quality} if quality else {}))
     return True
 
 
@@ -7240,8 +7243,9 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
 
 
 from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, CAPTION_PRESETS
-from hooks import add_hook_to_video, HOOK_SIZE_SCALES
+from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, subtitles_filter, CAPTION_PRESETS
+from ffmpeg_utils import QUALITY, QUALITY_FAST
+from hooks import add_hook_to_video, has_recipe as has_hook_recipe, HOOK_SIZE_SCALES
 from translate import translate_video, get_supported_languages
 from thumbnail import (analyze_video_for_titles, refine_titles, generate_thumbnail,
                        generate_youtube_description, extract_face_frames)
@@ -7469,6 +7473,7 @@ class SubtitleRequest(BaseModel):
     # alongside it overrides that field of the preset.
     preset: Optional[str] = None
     input_filename: Optional[str] = None
+    style_only: bool = False  # batch restyle keeps each clip's edited caption words
     # User-edited caption words. When present, the burn uses them VERBATIM
     # instead of regenerating from the stored transcript — without this, text
     # edits in the modal were silently discarded on the server render path.
@@ -8812,6 +8817,12 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     # Reload job data from disk just in case metadata was updated
     job = jobs[req.job_id]
     await _assert_job_owner(request, job)
+    lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
+    async with lock:
+        return await _add_subtitles_locked(req, request, job)
+
+
+async def _add_subtitles_locked(req, request, job):
 
     # We need to access metadata.json to get the transcript
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
@@ -8848,8 +8859,11 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     # User-edited captions win over both: build a synthetic clip-relative
     # transcript from them so the SRT/ASS generators burn the edited words
     # verbatim (issue #69 — edits used to be dropped on this path).
-    caption_words = None
-    if req.words:
+    caption_words = clip_data.get('caption_words') if req.style_only and req.words is None else None
+    if caption_words:
+        sub_transcript = _words_transcript(caption_words, (transcript or {}).get('language', 'en'))
+        sub_start, sub_end = 0.0, sub_transcript['segments'][0]['end']
+    elif req.words:
         if len(req.words) > 2000:
             raise HTTPException(status_code=400, detail="Too many caption words (max 2000).")
         # Leading space = Whisper's word-boundary convention; without it the
@@ -8877,17 +8891,28 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
              base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
              filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
 
-    # Re-subtitling must replace previous subtitles instead of burning over them.
-    filename = await asyncio.to_thread(_strip_burned_captions, output_dir, filename)
+    caption_style = {k: getattr(req, k) for k in CAPTION_STYLE_FIELDS}
+    clean_current = _strip_watermark_copy(output_dir, filename)
+    if (req.style_only and req.words is None and req.input_filename is None
+            and clip_data.get('caption_style') == caption_style
+            and re.match(r'^subtitled_\d+_', clean_current)
+            and os.path.isfile(os.path.join(output_dir, filename))):
+        if not watermarked.hihuclip_enabled() or watermarked.is_marked(filename):
+            if watermarked.hihuclip_enabled() and clean_current != filename:
+                filename = await _deliver(request, req.job_id, clean_current)
+            return {"success": True, "new_video_url": f"/videos/{req.job_id}/{filename}", "reused": True}
+
+    # A lazy hook's recipe can be rendered directly with the new captions.
+    filename = _strip_burned_captions(output_dir, filename, materialize=False)
 
     input_path = os.path.join(output_dir, filename)
-    if not os.path.exists(input_path):
+    if not os.path.exists(input_path) and not has_hook_recipe(output_dir, filename):
         # Try looking for edited version if url implied it?
         # Just fail if not found.
         raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
 
     # Define outputs
-    generation_id = int(time.time())
+    generation_id = time.time_ns()
     is_karaoke = req.style == "karaoke"
     srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
@@ -8898,7 +8923,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     # recorded there.
     seam_ranges = layout_ranges.split_ranges(
         clip_data.get('layout_ranges') or layout_ranges.read(input_path))
-    caption_style = {k: getattr(req, k) for k in CAPTION_STYLE_FIELDS}
+    quality = QUALITY if BILLING_ENABLED else QUALITY_FAST
     karaoke_opts = dict(
         split_ranges=seam_ranges,
         alignment=req.position, fontsize=req.font_size, font_name=req.font_name,
@@ -8963,14 +8988,14 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
                                alignment=req.position, fontsize=req.font_size,
                                font_name=req.font_name, font_color=req.font_color,
                                border_color=req.border_color, border_width=req.border_width,
-                               bg_color=req.bg_color, bg_opacity=req.bg_opacity)
+                               bg_color=req.bg_color, bg_opacity=req.bg_opacity, quality=quality)
             await loop.run_in_executor(None, run_burn)
         else:
             # Same code path the hook / edit / recut re-burn uses, so the look
             # recorded below is the look that was burned here.
-            success = await asyncio.get_event_loop().run_in_executor(
-                None, _burn_caption_style, input_path, output_path, srt_path,
-                sub_transcript, sub_start, sub_end, caption_style, seam_ranges)
+            success = await asyncio.to_thread(
+                _burn_caption_style, input_path, output_path, srt_path,
+                sub_transcript, sub_start, sub_end, caption_style, seam_ranges, quality=quality)
             if not success:
                 raise HTTPException(status_code=400, detail="No words found for this clip range.")
         
@@ -9134,23 +9159,24 @@ async def _editor_preview_file(job_id, clip_index, request, layer):
         if not re.match(r'^(?:wm_)?subtitled_\d+_', uncaptioned):
             path = os.path.join(output_dir, uncaptioned)
             if os.path.isfile(path):
-                return path
+                return path, None
         # Old jobs may only keep the hooked version as a recipe. Preview the
         # base video without encoding a second copy just to open the editor.
     source, _ = _hook_source(output_dir, filename, canonical)
     path = os.path.join(output_dir, source)
     if layer == "subtitles" and re.match(r'^(?:wm_)?subtitled_\d+_', source):
         raise HTTPException(status_code=409, detail="The clip before subtitles is unavailable.")
-    return path
+    return path, clips[clip_index].get('auto_hook') if layer == "subtitles" else None
 
 
 async def _editor_preview_url(job_id, clip_index, request, layer):
-    path = await _editor_preview_file(job_id, clip_index, request, layer)
+    path, hook = await _editor_preview_file(job_id, clip_index, request, layer)
     filename = os.path.basename(path)
+    payload = {"hook": hook} if hook else {}
     if _media_guard(f"{job_id}/{filename}"):
-        return {"video_url": f"/videos/{job_id}/{filename}"}
+        return {**payload, "video_url": f"/videos/{job_id}/{filename}"}
     if not BILLING_ENABLED and watermarked.hihuclip_enabled():
-        return {"video_url": f"/api/clip/{job_id}/{clip_index}/editor-preview/video?layer={layer}"}
+        return {**payload, "video_url": f"/api/clip/{job_id}/{clip_index}/editor-preview/video?layer={layer}"}
     raise HTTPException(status_code=409, detail="The editable preview is unavailable for this clip.")
 
 
@@ -9171,8 +9197,32 @@ async def stream_local_editor_preview(job_id: str, clip_index: int, request: Req
     # plans. The local editor resolves this file from its clip index only.
     if BILLING_ENABLED or not watermarked.hihuclip_enabled():
         raise HTTPException(status_code=404, detail="Not found")
-    path = await _editor_preview_file(job_id, clip_index, request, layer)
+    path, _ = await _editor_preview_file(job_id, clip_index, request, layer)
     return FileResponse(path, media_type="video/mp4", headers={"Cache-Control": "no-store"})
+
+
+def _plan_hook_captions(source, hooked, clip, transcript):
+    if not transcript and not clip.get('caption_words'):
+        return None
+    transcript, start, end = _caption_timeline(clip, transcript or {})
+    seams = layout_ranges.split_ranges(clip.get('layout_ranges') or layout_ranges.read(source))
+    directory, filename = os.path.split(hooked)
+    style = clip.get('caption_style')
+    if style:
+        stamp = time.time_ns()
+        ext = 'ass' if style.get('style') == 'karaoke' else 'srt'
+        sub_path = os.path.join(directory, f"subs_hook_{stamp}.{ext}")
+        options = _write_caption_style(sub_path, transcript, start, end, style, seams)
+        if options is None:
+            return None
+        vf = subtitles_filter(sub_path, **options)
+    else:
+        import main
+        plan = main.auto_caption_clip(source, transcript, start, end, plan_only=True, split_ranges=seams)
+        if plan is None:
+            return None
+        vf, stamp = plan
+    return vf, os.path.join(directory, f"subtitled_{stamp}_{filename}")
 
 
 @app.post("/api/hook")
@@ -9184,6 +9234,12 @@ async def add_hook(req: HookRequest, request: Request):
 
     job = jobs[req.job_id]
     await _assert_job_owner(request, job)
+    lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
+    async with lock:
+        return await _add_hook_locked(req, request, job)
+
+
+async def _add_hook_locked(req, request, job):
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     
@@ -9244,32 +9300,38 @@ async def add_hook(req: HookRequest, request: Request):
         try:
             # Run in thread pool
             def run_hook():
-                return add_hook_to_video(
+                captions = None
+                if had_captions:
+                    captions = _plan_hook_captions(input_path, output_path, clip_data, data.get('transcript'))
+                    if captions is None:
+                        raise HTTPException(status_code=500,
+                                            detail="Could not preserve the subtitles. Your previous clip is still available.")
+                add_hook_to_video(
                     input_path, req.text, output_path, position=req.position or "auto",
                     font_scale=font_scale, duration=req.duration_seconds, style=req.style,
                     font=req.font, intro_blur=req.intro_blur, layout_ranges=clip_data.get('layout_ranges'),
-                    has_captions=had_captions)
+                    has_captions=had_captions, also=captions,
+                    quality=QUALITY if BILLING_ENABLED else QUALITY_FAST)
+                return os.path.basename(captions[1] if captions else output_path)
 
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, run_hook)
+            output_filename = await asyncio.to_thread(run_hook)
 
         except Exception as e:
             print(f"❌ Hook Error: {e}")
             if reservation_id:
                 await _metering.release_reservation(reservation_id)
+            if isinstance(e, HTTPException):
+                raise
             raise HTTPException(status_code=500, detail=str(e))
 
         if reservation_id:
             await _metering.commit_reservation(reservation_id)
 
     # Captions back on top (see /api/edit for the same invariant).
-    if had_captions:
+    if req.remove and had_captions:
         recap = await asyncio.get_event_loop().run_in_executor(
             None, _reapply_captions, req.job_id, req.clip_index, output_path)
         if not recap:
-            if not req.remove:
-                with suppress(OSError):
-                    os.remove(output_path)
             raise HTTPException(status_code=500,
                                 detail="Could not preserve the subtitles. Your previous clip is still available.")
         output_filename = os.path.basename(recap)

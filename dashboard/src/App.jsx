@@ -724,8 +724,7 @@ function App() {
             shadow: options.shadow || 0,
             max_chars: options.maxChars ?? null,
             max_duration: options.maxDuration ?? null,
-            // Chain from the clip's current server file (its video_url basename).
-            input_filename: (clips[i].video_url || '').split('/').pop(),
+            style_only: true,
           }),
         });
         if (!res.ok) errors++;
