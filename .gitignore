@@ -26,6 +26,8 @@ output/
 
 # Secrets
 .env
+docker-compose.override.yml
+docker-compose.override.yaml
 
 # Generated metadata
 *_metadata.json

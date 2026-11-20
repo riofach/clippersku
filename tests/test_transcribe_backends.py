@@ -677,6 +677,7 @@ def test_media_seconds_reads_the_container(monkeypatch):
 class TestRequireGpu:
     @pytest.fixture(autouse=True)
     def _gpu_only(self, monkeypatch):
+        monkeypatch.setenv("WHISPER_DEVICE", "cuda")
         monkeypatch.setattr(tb, "_gpu_only", True)
         monkeypatch.setattr(tb, "_whisper_force_cpu", False)
         monkeypatch.setattr(tb, "_whisper_model", None)
@@ -710,7 +711,11 @@ class TestRequireGpu:
             tb.run_whisper_transcription("x.mp4")
 
 
-def test_without_require_gpu_a_cuda_failure_still_retries_on_the_cpu(monkeypatch):
+@pytest.mark.parametrize("failure", ["CUDA failed with error out of memory",
+                                     "Library libcublas.so.12 is not found",
+                                     "Library libcudnn.so.9 cannot be loaded"])
+def test_without_require_gpu_a_cuda_failure_still_retries_on_the_cpu(monkeypatch, failure):
+    monkeypatch.setenv("WHISPER_DEVICE", "cuda")
     monkeypatch.setattr(tb, "_gpu_only", False)
     monkeypatch.setattr(tb, "_whisper_force_cpu", False)
     calls = []
@@ -718,7 +723,7 @@ def test_without_require_gpu_a_cuda_failure_still_retries_on_the_cpu(monkeypatch
     def once(path, **params):
         calls.append(tb._whisper_force_cpu)
         if not tb._whisper_force_cpu:
-            raise RuntimeError("CUDA failed with error out of memory")
+            raise RuntimeError(failure)
         return [], SimpleNamespace(duration=0, language="en")
     monkeypatch.setattr(tb, "_run_whisper_once", once)
     assert tb.run_whisper_transcription("x.mp4")[0] == []

@@ -1,0 +1,18 @@
+services:
+  backend:
+    image: openshorts-backend:asr-cuda
+    build:
+      args:
+        ASR_CUDA: "1"
+    environment:
+      WHISPER_DEVICE: cuda
+      WHISPER_COMPUTE: int8_float16
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      GPU_DECODE: "0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

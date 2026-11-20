@@ -293,7 +293,8 @@ def run_whisper_transcription(media_path, **params):
     try:
         return _run_whisper_once(media_path, **params)
     except RuntimeError as e:
-        if _whisper_force_cpu or "cuda" not in str(e).lower():
+        gpu_error = any(name in str(e).lower() for name in ("cuda", "cublas", "cudnn"))
+        if _whisper_device() == "cpu" or not gpu_error:
             raise
         if _gpu_only:
             with _whisper_lock:

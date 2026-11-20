@@ -126,6 +126,16 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 # Latest yt-dlp (nightly — it updates frequently) plus its helper plugin.
 RUN pip install --upgrade --pre --no-cache-dir "yt-dlp[default]" bgutil-ytdlp-pot-provider
 
+# Optional CUDA runtime for Whisper only. Keeps the CPU rendering stack and
+# reuses the library versions already pinned in the full GPU build.
+ARG ASR_CUDA=0
+COPY requirements-gpu.lock /tmp/whisper-gpu.lock
+RUN if [ "$ASR_CUDA" = "1" ]; then \
+      grep -E '^nvidia-(cublas|cudnn)-cu12==' /tmp/whisper-gpu.lock > /tmp/asr-cuda.txt \
+      && pip install --no-cache-dir --no-deps -r /tmp/asr-cuda.txt \
+      && rm /tmp/asr-cuda.txt; \
+    fi && rm /tmp/whisper-gpu.lock
+
 # Copy application code
 COPY . .
 
