@@ -11,6 +11,7 @@ SPLIT = "split"
 PRESETS = (GAMING, PANEL)
 MANUAL_LAYOUTS = (*PRESETS, SPLIT)
 DEFAULT_GAMEPLAY_PERCENT = 60
+AUTO_FACECAM_SCALE = 1.18
 
 
 def panel_sizes(preset, width, height, *, count=4, gameplay_percent=DEFAULT_GAMEPLAY_PERCENT):
@@ -92,10 +93,17 @@ def initial_boxes(preset, width, height, out_w, out_h):
             for y in (0, half_h) for x in (0, half_w)]
 
 
-def gaming_boxes(width, height, sizes, inset):
+def gaming_boxes(width, height, sizes, inset, *, facecam_scale=1.0):
     x, y, w, h = inset
-    return [cover_box((width, height, 0, 0), sizes[0]),
-            cover_box((w, h, x, y), sizes[1])]
+    fw, fh, fx, fy = cover_box((w, h, x, y), sizes[1])
+    scale = min(facecam_scale, width / fw, height / fh)
+    wider = fw * scale
+    taller = fh * scale
+    # Keep the inset centered where possible, shifting the extra room inward
+    # for a facecam next to the source edge.
+    fx = min(max(0, fx + (fw - wider) / 2), width - wider)
+    fy = min(max(0, fy + (fh - taller) / 2), height - taller)
+    return [cover_box((width, height, 0, 0), sizes[0]), (wider, taller, fx, fy)]
 
 
 def automatic(preset, path, scenes, strategies, bounds, width, height, out_w, out_h,
@@ -109,7 +117,7 @@ def automatic(preset, path, scenes, strategies, bounds, width, height, out_w, ou
         if inset:
             for i in pending:
                 if camera_inset.present_in_scene(path, inset, *bounds[i]):
-                    detected[i] = gaming_boxes(width, height, sizes, inset)
+                    detected[i] = gaming_boxes(width, height, sizes, inset, facecam_scale=AUTO_FACECAM_SCALE)
     if pending and preset == PANEL:
         candidates = [s if i in pending else 'TRACK' for i, s in enumerate(strategies)]
         for i, centres in panel_layout.detect_panel_scenes(

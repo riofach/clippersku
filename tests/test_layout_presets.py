@@ -55,7 +55,14 @@ def test_facecam_uses_manual_crop_when_missing_and_only_splits_visible_scenes(mo
         [(0, 30), (30, 60), (60, 90)], 640, 360, 1080, 1920, {2: manual})
     assert set(got) == {0, 2}
     assert got[2] == presets.pixels(manual["boxes"], 640, 360)
-    assert got[0][1][2] >= 600
+    size = presets.panel_sizes('gaming', 1080, 1920)
+    regular = presets.gaming_boxes(640, 360, size, (600, 320, 40, 40))
+    w, h, x, y = got[0][1]
+    assert w == pytest.approx(regular[1][0] * 1.18)
+    assert h == pytest.approx(regular[1][1] * 1.18)
+    assert x + w <= 640 and y + h <= 360
+    assert x < 620 < x + w and y < 340 < y + h
+    assert got[0][0] == regular[0]
 
 
 def test_panel_supports_a_wide_tile_and_preserves_boxes_in_metadata(tmp_path, monkeypatch):
