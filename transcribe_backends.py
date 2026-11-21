@@ -25,6 +25,7 @@ supported European languages (e.g. Japanese/Chinese/Arabic uploads).
 GPU whisper in turn falls back to CPU whisper on CUDA errors (VRAM is shared
 with other models on the host, so loads can OOM under load).
 """
+import math
 import os
 import re
 import subprocess
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 
 from subtitles import (
     get_whisper_config,
@@ -40,6 +42,8 @@ from subtitles import (
 )
 
 PARAKEET_MODEL_ID = "nemo-parakeet-tdt-0.6b-v3"
+WHISPER_WINDOW_SECONDS = 15 * 60
+WHISPER_WINDOW_OVERLAP = 2
 
 # The 25 European languages parakeet-tdt-0.6b-v3 supports (ISO 639-1).
 PARAKEET_LANGS = {
@@ -253,7 +257,7 @@ def _whisper_device():
     return "cpu" if _whisper_force_cpu else get_whisper_config()["device"]
 
 
-def _run_whisper_once(media_path, **params):
+def _run_whisper_once(media_path, *, on_progress=None, **params):
     # A CPU decode keeps the host slot: the process still holds its CUDA
     # context (~825 MB) until it exits, so the slot still stands for memory
     # on the card. Handing it back let the next process in, which hit the
@@ -267,14 +271,16 @@ def _run_whisper_once(media_path, **params):
     with gate:
         model, _device = _get_whisper_model()
         segments, info = model.transcribe(media_path, **params)
-        progress = _TranscribeProgress(getattr(info, "duration", 0))
+        progress = _TranscribeProgress(getattr(info, "duration", 0)) if on_progress is None else None
+        update = progress.update if progress is not None else on_progress
         materialized = []
         for segment in segments:
             materialized.append(segment)
-            progress.update(segment.end)
+            update(segment.end)
         # VAD trims trailing silence, so the last segment can end short of the
         # media duration — force the 100% line.
-        progress.update(progress.total)
+        if progress is not None:
+            progress.update(progress.total)
         return materialized, info
 
 
@@ -307,29 +313,75 @@ def run_whisper_transcription(media_path, **params):
         return _run_whisper_once(media_path, **params)
 
 
-def _transcribe_with_whisper(media_path):
-    segments, info = run_whisper_transcription(media_path, **WHISPER_TRANSCRIBE_PARAMS)
-
-    out_segments = []
-    text_parts = []
+def _whisper_segments(segments, *, offset=0, window=None):
     for segment in segments:
-        words = [
-            {"word": w.word, "start": float(w.start), "end": float(w.end)}
+        words = merge_continuation_words([
+            {"word": w.word, "start": offset + float(w.start), "end": offset + float(w.end)}
             for w in (segment.words or [])
-        ]
-        out_segments.append({
-            "start": float(segment.start),
-            "end": float(segment.end),
-            "text": segment.text,
-            "words": merge_continuation_words(words),
-        })
-        text_parts.append(segment.text.strip())
+        ])
+        start, end = offset + float(segment.start), offset + float(segment.end)
+        text = segment.text
+        if window is not None:
+            left, right = window
+            if words:
+                kept = [word for word in words if left <= (word['start'] + word['end']) / 2 < right]
+                if not kept:
+                    continue
+                if len(kept) != len(words):
+                    text = ''.join(word['word'] for word in kept)
+                    start, end = kept[0]['start'], kept[-1]['end']
+                words = [{**word, 'start': max(left, word['start']), 'end': min(right, word['end'])}
+                         for word in kept]
+            elif not left <= (start + end) / 2 < right:
+                continue
+            start, end = max(left, start), min(right, end)
+        yield {"start": start, "end": end, "text": text, "words": words}
 
+
+def _whisper_transcript(segments, language):
     return {
-        "text": " ".join(part for part in text_parts if part),
-        "language": info.language,
-        "segments": out_segments,
+        "text": " ".join(segment['text'].strip() for segment in segments if segment['text'].strip()),
+        "language": language,
+        "segments": segments,
     }
+
+
+def _transcribe_with_whisper(media_path):
+    duration = media_seconds(media_path)
+    if not duration or not math.isfinite(duration) or duration <= WHISPER_WINDOW_SECONDS:
+        segments, info = run_whisper_transcription(media_path, **WHISPER_TRANSCRIBE_PARAMS)
+        return _whisper_transcript(list(_whisper_segments(segments)), info.language)
+
+    # faster-whisper decodes and featurizes its entire input in RAM. Give it
+    # one bounded, seeked PCM window at a time and keep the full VOD timeline.
+    progress = _TranscribeProgress(duration)
+    combined = []
+    language = None
+    with tempfile.TemporaryDirectory(prefix='openshorts-asr-') as directory:
+        wav_path = os.path.join(directory, 'window.wav')
+        for left in range(0, math.ceil(duration), WHISPER_WINDOW_SECONDS):
+            right = min(duration, left + WHISPER_WINDOW_SECONDS)
+            offset = max(0, left - WHISPER_WINDOW_OVERLAP)
+            stop = min(duration, right + WHISPER_WINDOW_OVERLAP)
+            subprocess.run([
+                'ffmpeg', '-nostdin', '-y', '-v', 'error', '-ss', f'{offset:.3f}',
+                '-i', os.fspath(media_path), '-t', f'{stop - offset:.3f}',
+                '-map', '0:a:0', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav_path,
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
+            with wave.open(wav_path, 'rb') as audio:
+                has_samples = audio.getnframes() > 0
+            if has_samples:
+                options = dict(WHISPER_TRANSCRIBE_PARAMS)
+                if language is not None:
+                    options['language'] = language
+                segments, info = run_whisper_transcription(
+                    wav_path, on_progress=lambda pos: progress.update(min(right, offset + pos)), **options)
+                window_segments = list(_whisper_segments(segments, offset=offset, window=(left, right)))
+                if language is None and window_segments:
+                    language = info.language
+                combined.extend(window_segments)
+            progress.update(right)
+    return _whisper_transcript(combined, language or 'unknown')
 
 
 # --- parakeet ---------------------------------------------------------------

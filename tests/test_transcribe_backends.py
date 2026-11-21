@@ -213,6 +213,43 @@ def test_run_whisper_transcription_materializes_segments(fake_faster_whisper, mo
     assert info.language == "es"
 
 
+def test_whisper_longsources_use_bounded_windows_and_keep_absolute_word_times(monkeypatch):
+    import wave
+
+    monkeypatch.setattr(tb, 'media_seconds', lambda _: 20.0)
+    monkeypatch.setattr(tb, 'WHISPER_WINDOW_SECONDS', 10)
+    calls = []
+
+    def extract(argv, **kwargs):
+        calls.append((float(argv[argv.index('-ss') + 1]), float(argv[argv.index('-t') + 1])))
+        with wave.open(argv[-1], 'wb') as wav:
+            wav.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+            wav.writeframes(b'\x00\x00')
+
+    def words(*values):
+        return [SimpleNamespace(word=text, start=start, end=end) for text, start, end in values]
+
+    def transcribe(path, **params):
+        if len(calls) == 1:
+            assert 'language' not in params
+            raw = words((' awal', 1, 2), (' sambungan', 9.5, 10.5))
+        else:
+            assert params['language'] == 'id'
+            raw = words((' sambungan', 1.5, 2.5), (' akhir', 4, 5))
+        return [SimpleNamespace(start=raw[0].start, end=raw[-1].end,
+                                text=''.join(word.word for word in raw), words=raw)], SimpleNamespace(language='id')
+
+    monkeypatch.setattr(tb.subprocess, 'run', extract)
+    monkeypatch.setattr(tb, 'run_whisper_transcription', transcribe)
+    result = tb._transcribe_with_whisper('video.mp4')
+    assert calls == [(0.0, 12.0), (8.0, 12.0)]
+    assert result['text'] == 'awal sambungan akhir'
+    assert result['language'] == 'id'
+    assert [(w['word'], w['start'], w['end']) for s in result['segments'] for w in s['words']] == [
+        (' awal', 1.0, 2.0), (' sambungan', 10.0, 10.5), (' akhir', 12.0, 13.0),
+    ]
+
+
 # --- release_models: the API process must not keep the models resident ------
 
 class _FakeCT2:
