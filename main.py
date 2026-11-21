@@ -27,6 +27,7 @@ from google.genai import types as genai_types
 import frame_sampler
 import gpu_decode
 import gemini_worker
+import gemini_quota
 import hook_grounding
 import layout_picker
 import llm_backend
@@ -2022,8 +2023,7 @@ def save_transcript_checkpoint(output_dir, transcript, input_video, duration):
     try:
         payload = {"source": _checkpoint_source_key(input_video, duration),
                    "transcript": transcript}
-        with open(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT), "w") as f:
-            json.dump(payload, f)
+        write_json_atomic(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT), payload)
     except Exception as e:
         print(f"⚠️ Could not save transcript checkpoint: {e}")
 
@@ -2237,6 +2237,20 @@ def transcribe_video(video_path, slot_timeout=None):
 
     return transcript
 
+def _wait_for_gemini_retry(error, attempt, max_attempts):
+    limit = gemini_quota.rate_limit(error)
+    if limit is None:
+        return False
+    daily, seconds = limit
+    if daily and os.environ.get('GEMINI_QUOTA_RESUME') == '1':
+        raise gemini_quota.DailyQuotaReached(gemini_quota.next_daily_reset() + 5) from error
+    if daily or attempt >= max_attempts:
+        raise error
+    print(f"⏳ Gemini rate limit. Retrying the same request in {math.ceil(seconds)} seconds.", flush=True)
+    time.sleep(seconds)
+    return True
+
+
 def _run_gemini_stage(client, model_name, prompt, schema):
     """One schema-enforced model call with transient-error backoff.
     Returns (parsed_dict, cost_analysis).
@@ -2275,6 +2289,8 @@ def _run_gemini_stage(client, model_name, prompt, schema):
         except gemini_worker.GeminiBlockedError:
             raise  # deterministic policy block — never retry
         except Exception as e:
+            if not use_local and _wait_for_gemini_retry(e, attempt, max_attempts):
+                continue
             msg = str(e)
             transient = any(tok in msg for tok in (
                 '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
@@ -2293,7 +2309,7 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             time.sleep(wait)
 
 
-def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs, label):
+def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs, label, checkpoint=None):
     """Run a Gemini stage over ``items``; on a policy block, bisect.
 
     Google's prompt filter (PROHIBITED_CONTENT) fires on some COMBINATIONS of
@@ -2307,7 +2323,11 @@ def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs
         return []
     prompt = build_prompt(items)
     try:
-        parsed, cost = _run_gemini_stage(client, model_name, prompt, schema)
+        if checkpoint is None:
+            parsed, cost = _run_gemini_stage(client, model_name, prompt, schema)
+        else:
+            parsed, cost = checkpoint.call([label, model_name, schema.__name__, prompt],
+                                           lambda: _run_gemini_stage(client, model_name, prompt, schema))
         if cost:
             costs.append(cost)
         return list(parsed.get(key) or [])
@@ -2317,8 +2337,8 @@ def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs
             return []
         mid = len(items) // 2
         print(f"   🚫 {label}: Gemini blocked a batch of {len(items)}; retrying as {mid} + {len(items) - mid}")
-        return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label)
-                + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label))
+        return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label, checkpoint)
+                + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label, checkpoint))
 
 
 def score_batch_size():
@@ -2337,7 +2357,7 @@ def _clip_selection_mode():
     return selection_mode(os.getenv('CLIP_SELECTION_MODE'), os.getenv('CLIP_LAYOUT_PRESET'))
 
 
-def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
+def get_viral_clips(transcript_result, video_duration, viewer_clips=None, checkpoint=None):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2431,7 +2451,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         for batch in score_batches(windows, SCORE_BATCH):
             scored.extend(_run_stage_split(
                 client, model_name, batch, _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
+                gemini_worker.ScoreResponse, "windows", costs, "score", **({'checkpoint': checkpoint} if checkpoint else {})))
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
@@ -2466,7 +2486,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
 
         shorts = _run_stage_split(client, model_name, shortlist,
                                   _detail_prompt_for(min_clips, max_clips),
-                                  detail_schema, "shorts", costs, "detail")
+                                  detail_schema, "shorts", costs, "detail", **({'checkpoint': checkpoint} if checkpoint else {}))
 
         # The floor lived only in the prompt, and a prompt is not a contract:
         # the model regularly returned half of it and the job shipped that.
@@ -2484,7 +2504,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                 extra = _run_stage_split(
                     client, model_name, spare,
                     _detail_prompt_for(missing, max(missing, len(spare))),
-                    detail_schema, "shorts", costs, "detail-floor")
+                    detail_schema, "shorts", costs, "detail-floor", **({'checkpoint': checkpoint} if checkpoint else {}))
                 if extra:
                     shorts = sorted(shorts + extra,
                                     key=lambda s: float(s.get("start") or 0))
@@ -2546,6 +2566,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         if cost_analysis:
             result["cost_analysis"] = cost_analysis
         return result
+    except gemini_quota.DailyQuotaReached:
+        raise
     except gemini_worker.GeminiBlockedError as e:
         # Content-policy rejection: propagate so the job fails with the real
         # reason instead of a generic "no clips found".
@@ -2668,8 +2690,14 @@ def _visual_pass(client, model_name, video_path, duration, language,
             response_mime_type="application/json",
             response_schema=gemini_worker.VisualResponse,
         )
-        response = client.models.generate_content(
-            model=model_name, contents=[file_upload, prompt], config=config)
+        for attempt in range(1, 4):
+            try:
+                response = client.models.generate_content(
+                    model=model_name, contents=[file_upload, prompt], config=config)
+                break
+            except Exception as error:
+                if not _wait_for_gemini_retry(error, attempt, 3):
+                    raise
         gemini_worker.raise_if_blocked(response)
         parsed = json.loads(response.text)
         clean = []
@@ -2687,7 +2715,7 @@ def _visual_pass(client, model_name, video_path, duration, language,
                 pass
 
 
-def get_visual_clips(video_path, video_duration, language="en", viewer_clips=None):
+def get_visual_clips(video_path, video_duration, language="en", viewer_clips=None, checkpoint=None):
     """Clip a SILENT video by vision: Gemini watches the footage and picks the
     most engaging visual moments (no transcript). Returns the same
     {"shorts", "cost_analysis"} shape as get_viral_clips, or None.
@@ -2746,12 +2774,17 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
             for i, (s0, s1) in enumerate(segments):
                 proxy = os.path.join(tmp_dir, f"part{i}.mp4")
                 try:
-                    _vision_proxy(video_path, s0, s1, proxy)
-                    shorts, cost = _visual_pass(
-                        client, model_name, proxy, round(s1 - s0, 3), language,
-                        per_min, v_max_clips, v_min_secs, v_max_secs,
-                        hint=(_viewer_hint(viewer_clips, s0, s1 - s0) or '') + gaming_hint)
-                except gemini_worker.GeminiBlockedError:
+                    hint = (_viewer_hint(viewer_clips, s0, s1 - s0) or '') + gaming_hint
+
+                    def analyze():
+                        _vision_proxy(video_path, s0, s1, proxy)
+                        return _visual_pass(client, model_name, proxy, round(s1 - s0, 3), language,
+                                            per_min, v_max_clips, v_min_secs, v_max_secs, hint=hint)
+
+                    identity = ['vision', os.path.basename(video_path), model_name, s0, s1,
+                                language, per_min, v_max_clips, v_min_secs, v_max_secs, hint]
+                    shorts, cost = checkpoint.call(identity, analyze) if checkpoint else analyze()
+                except (gemini_worker.GeminiBlockedError, gemini_quota.DailyQuotaReached):
                     raise
                 except Exception as e:
                     # One bad stretch must not sink the other hours.
@@ -2786,6 +2819,8 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
         if cost:
             result["cost_analysis"] = cost
         return result
+    except gemini_quota.DailyQuotaReached:
+        raise
     except gemini_worker.GeminiBlockedError as e:
         print(f"🚫 {e}")
         raise
@@ -2814,6 +2849,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     output_format = args.format
     layout_preset = os.getenv("CLIP_LAYOUT_PRESET") if output_format in ("auto", "vertical") else None
+    quota_resume = os.environ.get('GEMINI_QUOTA_RESUME') == '1'
+    quota_checkpoint = gemini_quota.read_wait(args.output or '.') if quota_resume else None
 
     script_start_time = time.time()
 
@@ -2880,12 +2917,22 @@ if __name__ == '__main__':
     # What the stream's viewers clipped (Twitch VODs only; [] otherwise or
     # without TWITCH_CLIENT_ID). A URL call, so it runs before the download and
     # the early pick below gets it too.
-    viewer_clips = []
-    if args.url and not args.skip_analysis and not args.prepare_only:
+    viewer_clips = quota_checkpoint.get('viewer_clips', []) if quota_checkpoint else []
+    if not quota_checkpoint and args.url and not args.skip_analysis and not args.prepare_only:
         viewer_clips = twitch_signals.viewer_clips_for_job(args.url, 0)
 
     # 1. Get Input Video
-    if args.url:
+    if quota_checkpoint:
+        output_dir = _ensure_dir(args.output or '.')
+        name = os.path.basename(quota_checkpoint.get('source') or '')
+        input_video = os.path.join(output_dir, name)
+        if not os.path.isfile(input_video) and args.input and os.path.basename(args.input) == name:
+            input_video = args.input
+        if not os.path.isfile(input_video):
+            raise RuntimeError('The source video saved for the paused Gemini analysis is unavailable.')
+        video_title = os.path.basename(quota_checkpoint.get('title') or os.path.splitext(name)[0])
+        print('♻️ Reusing the saved video for Gemini analysis.', flush=True)
+    elif args.url:
         # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
         # For whole-video runs (--skip-analysis), --output can be a file path.
         if args.output and not args.skip_analysis:
@@ -2913,7 +2960,7 @@ if __name__ == '__main__':
             try:
                 t = transcribe_video(audio_path)
                 early["transcript"] = t
-                if audio_duration and not speech_is_sparse(t, audio_duration):
+                if not quota_resume and audio_duration and not speech_is_sparse(t, audio_duration):
                     early["clips"] = get_viral_clips(t, audio_duration,
                                                      viewer_clips=viewer_clips)
             except Exception as e:
@@ -2963,10 +3010,10 @@ if __name__ == '__main__':
 
     # Quota-wall offer: only the first N minutes were paid for (see
     # cap_source_duration). Must run before anything reads the file.
-    if os.environ.get("MAX_SOURCE_MINUTES", "").strip():
+    if not quota_checkpoint and os.environ.get("MAX_SOURCE_MINUTES", "").strip():
         input_video = cap_source_duration(input_video, os.environ["MAX_SOURCE_MINUTES"],
                                           start_seconds=os.environ.get("SOURCE_START_SECONDS", 0))
-    elif os.environ.get("SOURCE_CAP_MINUTES", "").strip():
+    elif not quota_checkpoint and os.environ.get("SOURCE_CAP_MINUTES", "").strip():
         # Whole-video metered job: never process more than was reserved.
         def _stamp(path):
             try:
@@ -3100,7 +3147,7 @@ if __name__ == '__main__':
             if transcript is not None:
                 transcript_from_cache = True
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
-        if transcript is None:
+        if transcript is None and not (quota_checkpoint and quota_checkpoint.get('visual')):
             try:
                 transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
@@ -3121,14 +3168,28 @@ if __name__ == '__main__':
 
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
-        if (transcript is not None and early_clips
-                and transcript is early_state["transcript"]):
-            print("♻️ Using the clips Gemini picked while the video downloaded.")
-            clips_data = early_clips
-        elif transcript is not None:
-            clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips)
-        else:
-            clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips)
+        checkpoint = gemini_quota.AnalysisCheckpoint(output_dir) if quota_resume else None
+        try:
+            if (transcript is not None and early_clips and transcript is early_state["transcript"]):
+                print("♻️ Using the clips Gemini picked while the video downloaded.")
+                clips_data = early_clips
+            elif transcript is not None:
+                clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips, checkpoint=checkpoint)
+            else:
+                clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips, checkpoint=checkpoint)
+        except gemini_quota.DailyQuotaReached as pause:
+            if transcript is not None and load_transcript_checkpoint(output_dir, input_video, duration) is None:
+                save_transcript_checkpoint(output_dir, transcript, input_video, duration)
+                if load_transcript_checkpoint(output_dir, input_video, duration) is None:
+                    raise RuntimeError('Could not save the transcript before pausing Gemini analysis.') from pause
+            write_json_atomic(os.path.join(output_dir, gemini_quota.WAIT_FILE), {
+                'resume_at': pause.resume_at, 'paused_at': time.time(), 'source': os.path.basename(input_video),
+                'title': video_title, 'viewer_clips': viewer_clips, 'visual': transcript is None,
+                'key_id': gemini_quota.key_fingerprint(os.getenv('GEMINI_API_KEY')),
+                'options': {key: os.environ[key] for key in gemini_quota.RESUME_OPTIONS if key in os.environ},
+            })
+            print('⏳ Gemini daily quota reached. Analysis progress saved.', flush=True)
+            raise SystemExit(gemini_quota.WAIT_EXIT)
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
@@ -3320,6 +3381,12 @@ if __name__ == '__main__':
     # The job finished: a later run in this directory must transcribe afresh.
     if not args.skip_analysis:
         clear_transcript_checkpoint(output_dir)
+        if quota_resume:
+            for name in (gemini_quota.WAIT_FILE, gemini_quota.ANALYSIS_FILE):
+                try:
+                    os.remove(os.path.join(output_dir, name))
+                except FileNotFoundError:
+                    pass
 
     total_time = time.time() - script_start_time
     print(f"\n⏱️  Total execution time: {total_time:.2f}s")

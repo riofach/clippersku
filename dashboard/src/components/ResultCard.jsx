@@ -390,7 +390,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         setIsEditing(true);
         setEditError(null);
         try {
-            const apiKey = geminiApiKey || localStorage.getItem('gemini_key');
+            const apiKey = geminiApiKey;
 
             // Managed (paid) users get the Gemini key resolved server-side;
             // only BYOK/self-host needs a local key.

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
 import KeyInput from './components/KeyInput';
+import { GEMINI_PROFILES_STORAGE, loadGeminiProfiles, saveGeminiProfiles } from './lib/geminiProfiles';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import WatermarkSettings from './components/WatermarkSettings';
@@ -323,11 +324,19 @@ function App() {
   }, [queueSlow, queueInfo]);
   // Why the last job could not start or failed, in plain words (or '').
   const [jobError, setJobError] = useState('');
+  const [geminiWait, setGeminiWait] = useState(null);
+  const quotaKeyAttempt = useRef(null);
   // Durable R2 URLs (per clip index) for the current job — used as a fallback when
   // the ephemeral local /videos/ files have been cleaned up (e.g. after a reload).
   const [durableClips, setDurableClips] = useState({});
 
-  const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  const [geminiProfiles, setGeminiProfiles] = useState(loadGeminiProfiles);
+  const apiKey = geminiProfiles.keys.find((entry) => entry.id === geminiProfiles.activeId)?.value ?? '';
+
+  const updateGeminiProfiles = (profiles) => {
+    saveGeminiProfiles(profiles);
+    setGeminiProfiles(profiles);
+  };
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
@@ -455,6 +464,7 @@ function App() {
   // Read by in-flight async chases to notice that the user moved on to another job.
   const jobIdRef = useRef(jobId);
   useEffect(() => { jobIdRef.current = jobId; }, [jobId]);
+  useEffect(() => { setGeminiWait(null); }, [jobId]);
 
   const flushClipState = () => {
     const s = clipStateSync.current;
@@ -772,7 +782,7 @@ function App() {
       const saved = localStorage.getItem(SESSION_KEY);
       if (!saved) return;
       const session = JSON.parse(saved);
-      if (Date.now() - session.timestamp > SESSION_MAX_AGE) {
+      if (Date.now() - session.timestamp > SESSION_MAX_AGE && session.status !== 'processing') {
         localStorage.removeItem(SESSION_KEY);
         return;
       }
@@ -833,10 +843,12 @@ function App() {
   }, [jobId, status, results, activeTab, noSource, projectState]);
 
   useEffect(() => {
-    // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
-    // For now keeping gemini plain for compatibility unless requested.
-    if (apiKey) localStorage.setItem('gemini_key', apiKey);
-  }, [apiKey]);
+    const sync = (event) => {
+      if (event.key === GEMINI_PROFILES_STORAGE || event.key === null) setGeminiProfiles(loadGeminiProfiles());
+    };
+    window.addEventListener('storage', sync);
+    return () => window.removeEventListener('storage', sync);
+  }, []);
 
   useEffect(() => {
     if (uploadPostKey) {
@@ -949,8 +961,23 @@ function App() {
           }
 
           if (data.partial) setPartialJob(data.partial);
-          setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
-          nextDelay = data.status === 'queued' ? 5000 : 2000;
+          setGeminiWait(data.gemini_wait ?? null);
+          if (!data.gemini_wait?.needs_key) quotaKeyAttempt.current = null;
+          else if (apiKey &&
+              (quotaKeyAttempt.current?.jobId !== jobId || quotaKeyAttempt.current?.key !== apiKey)) {
+            quotaKeyAttempt.current = { jobId, key: apiKey };
+            try {
+              const attach = await apiFetch(`/api/status/${jobId}/gemini-resume`, {
+                method: 'POST', headers: { 'X-Gemini-Key': apiKey },
+              });
+              if (attach.ok && jobIdRef.current === jobId) setGeminiWait(await attach.json());
+              if (!attach.ok && attach.status !== 409) quotaKeyAttempt.current = null;
+            } catch { quotaKeyAttempt.current = null; }
+          }
+          setQueueInfo(data.status === 'queued' && !data.gemini_wait && data.queue ? data.queue : null);
+          nextDelay = data.gemini_wait && !data.gemini_wait.needs_key
+            ? Math.max(5000, Math.min(60000, data.gemini_wait.resume_at * 1000 - Date.now()))
+            : data.status === 'queued' ? 5000 : 2000;
 
           if (data.status === 'completed') {
             setQueueInfo(null);
@@ -995,7 +1022,7 @@ function App() {
       stop();
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [status, jobId, refreshMe]);
+  }, [status, jobId, refreshMe, apiKey]);
 
 
   // silent: background auto-fetch — never alert(), just log. Managed users need
@@ -1882,7 +1909,7 @@ function App() {
                 </div>
               ) : (
                 <>
-              <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+              <KeyInput profiles={geminiProfiles} onChange={updateGeminiProfiles} />
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -2313,6 +2340,13 @@ function App() {
                     {status.toUpperCase()}
                   </span>
                 </div>
+                {status === 'processing' && geminiWait && (
+                  <div role="status" className="mb-4 rounded-input border border-rule bg-paper3 p-3 text-xs text-ink2">
+                    {geminiWait.needs_key
+                      ? 'Gemini analysis is saved. Select the original Gemini key in Settings to resume.'
+                      : `Gemini daily quota reached. The saved analysis will resume at ${new Date(geminiWait.resume_at * 1000).toLocaleString()}.`}
+                  </div>
+                )}
 
                 {/* Trimmed run: say it while it renders, not only once the
                     clips land, so the shorter result is no surprise. */}

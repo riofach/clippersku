@@ -1,5 +1,6 @@
 import os
 import llm_backend
+import gemini_quota
 import re
 import sys
 import uuid
@@ -2499,8 +2500,10 @@ def _resume_candidates(held: set, now: float):
         # that only waited in the queue through deploys has crashed nothing.
         # Counting every resume dropped long-queued videos that never ran
         # once a few deploys had gone by.
-        ran = (float(m.get("run_started") or m.get("heartbeat") or 0)
-               > float(m.get("resumed_at") or 0))
+        run_started = float(m.get("run_started") or m.get("heartbeat") or 0)
+        wait = gemini_quota.read_wait(os.path.join(OUTPUT_DIR, job_id)) if not BILLING_ENABLED else None
+        ran = (run_started > float(m.get("resumed_at") or 0)
+               and not (wait and float(wait.get('paused_at') or 0) >= run_started))
         attempts = int(m.get("attempts", 0)) + (1 if ran else 0)
         reservation_id = m.get("reservation_id")
         # A cut delivery runs no main.py again (nothing there can crash the
@@ -2620,6 +2623,16 @@ def _register_resumed(picked) -> int:
             jobs[job_id]['logs'] = _TimedLog(["♻️ Finishing your video after a server update."])
             _resume_delivery_record(job_id, jobs[job_id], m)
             _pending_deliveries.append(job_id)
+            resumed += 1
+            continue
+        wait = gemini_quota.read_wait(job_path) if not BILLING_ENABLED else None
+        if wait:
+            options = wait.get('options') or {}
+            for key in gemini_quota.RESUME_OPTIONS:
+                env.pop(key, None)
+                if key in options and isinstance(options[key], str):
+                    env[key] = options[key]
+            _schedule_gemini_resume(job_id, jobs[job_id], wait)
             resumed += 1
             continue
         _enqueue_job(job_id, priority)
@@ -3432,6 +3445,10 @@ async def run_job_wrapper(job_id):
             if interrupted:
                 raise asyncio.CancelledError()
             return
+        if job and job.get('gemini_wait'):
+            _schedule_gemini_resume(job_id, job, job['gemini_wait'])
+            _release_slot(job_id)
+            return
         if _should_auto_retry(job):
             _schedule_auto_retry(job_id, job)
             _release_slot(job_id)
@@ -3725,6 +3742,38 @@ def _schedule_auto_retry(job_id, job):
             await _raise_to_owner_plans([job_id])
 
     asyncio.create_task(_later())
+
+
+def _gemini_wait_status(job):
+    wait = job.get('gemini_wait')
+    if not wait:
+        return None
+    key = (job.get('env') or {}).get('GEMINI_API_KEY')
+    return {'resume_at': wait['resume_at'],
+            'needs_key': not key or gemini_quota.key_fingerprint(key) != wait.get('key_id')}
+
+
+def _schedule_gemini_resume(job_id, job, wait):
+    job['status'] = 'queued'
+    job['gemini_wait'] = wait
+    state = _gemini_wait_status(job)
+    if state['needs_key'] or job.get('gemini_resume_scheduled'):
+        return
+    job['gemini_resume_scheduled'] = True
+    job['logs'].append('⏳ Waiting for the Gemini daily quota reset. Video and analysis progress are saved.')
+
+    async def later():
+        try:
+            await asyncio.sleep(max(0, wait['resume_at'] - time.time()))
+            if jobs.get(job_id) is job and job.get('gemini_wait') is wait and not _draining:
+                job.pop('gemini_wait', None)
+                job['logs'].append('♻️ Gemini quota window reopened. Resuming from saved analysis.')
+                manifest = _read_manifest(job_id) or {}
+                _enqueue_job(job_id, int(manifest.get('priority', 2)))
+        finally:
+            job.pop('gemini_resume_scheduled', None)
+
+    asyncio.create_task(later())
 
 
 async def _archive_managed_job(job_id):
@@ -5221,6 +5270,8 @@ async def run_job(job_id, job_data):
 
     cmd = job_data['cmd']
     env = _job_encode_env(job_data['env'])
+    if not BILLING_ENABLED and env.get('GEMINI_API_KEY'):
+        env['GEMINI_QUOTA_RESUME'] = '1'
     if await _paid_proxy_budget_exceeded():
         # The daily paid-proxy budget ran out while this job was queued.
         env.pop("PROXY_URL", None)
@@ -5233,6 +5284,11 @@ async def run_job(job_id, job_data):
     try:
         returncode = await _run_main(
             job_id, cmd, env, tick=lambda: _refresh_partial_result(job_id, output_dir))
+        if returncode == gemini_quota.WAIT_EXIT and env.get('GEMINI_QUOTA_RESUME') == '1':
+            wait = gemini_quota.read_wait(output_dir)
+            if wait:
+                job_data['gemini_wait'] = wait
+                return
         _finish_job(job_id, returncode, output_dir)
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
@@ -6633,7 +6689,7 @@ def _status_signature(job_id, job):
     return (_presented_status(job_id, job), len(job.get('logs') or ()),
             len(clips) if isinstance(clips, list) else -1,
             json.dumps(job.get('partial'), sort_keys=True, default=str),
-            str(job.get('user_id')))
+            str(job.get('user_id')), _gemini_wait_status(job))
 
 
 def _status_snapshot(job_id, job):
@@ -6643,7 +6699,8 @@ def _status_snapshot(job_id, job):
             "owner": None if owner is None else str(owner),
             "status": _presented_status(job_id, job),
             "logs": lines, "log_times": times,
-            "result": job.get('result'), "partial": job.get('partial')}
+            "result": job.get('result'), "partial": job.get('partial'),
+            "gemini_wait": _gemini_wait_status(job)}
 
 
 def _write_status_files(writes, removes, queue_view):
@@ -6766,6 +6823,7 @@ async def _status_from_snapshot(request, snap, queue):
     status = snap.get("status")
     return {
         "status": status,
+        "gemini_wait": snap.get('gemini_wait'),
         "logs": snap.get("logs") or [],
         "log_times": snap.get("log_times"),
         "result": _with_download_urls(snap.get("result")),
@@ -6798,7 +6856,23 @@ async def get_status(job_id: str, request: Request):
         # Set when only the first part of the source was clipped (quota wall
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
+        "gemini_wait": _gemini_wait_status(job),
     }
+
+
+@app.post('/api/status/{job_id}/gemini-resume')
+async def attach_gemini_resume_key(job_id: str, request: Request):
+    job = jobs.get(job_id)
+    wait = (job or {}).get('gemini_wait')
+    if BILLING_ENABLED or not wait:
+        raise HTTPException(status_code=404, detail='Paused Gemini job not found.')
+    await _assert_job_owner(request, job)
+    key = request.headers.get('X-Gemini-Key', '').strip()
+    if not key or gemini_quota.key_fingerprint(key) != wait.get('key_id'):
+        raise HTTPException(status_code=409, detail='Select the Gemini key used when this job started.')
+    job['env']['GEMINI_API_KEY'] = key
+    _schedule_gemini_resume(job_id, job, wait)
+    return _gemini_wait_status(job)
 
 
 def _locate_source(job_id: str):
