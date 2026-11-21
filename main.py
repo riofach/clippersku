@@ -34,7 +34,7 @@ import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets, gaming_story_range,
                             clip_duration_bounds, dedupe_overlapping,
-                            score_batches, shortlist_target,
+                            podcast_story_range, score_batches, selection_mode, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
@@ -2333,6 +2333,10 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
+def _clip_selection_mode():
+    return selection_mode(os.getenv('CLIP_SELECTION_MODE'), os.getenv('CLIP_LAYOUT_PRESET'))
+
+
 def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
@@ -2346,7 +2350,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
     that hold them, and the hottest windows are guaranteed a shortlist slot.
     """
     language = str(transcript_result.get('language') or 'unknown')
-    gaming = os.getenv('CLIP_LAYOUT_PRESET') == 'gaming'
+    mode = _clip_selection_mode()
+    gaming = mode == 'gaming'
+    podcast = mode == 'podcast'
+    detail_schema = gemini_worker.PodcastDetailResponse if podcast else gemini_worker.DetailResponse
+    story_rules = {'gaming': gemini_worker.GAMING_STORY_RULES,
+                   'podcast': gemini_worker.PODCAST_STORY_RULES}.get(mode, '')
     if llm_backend.active():
         # Self-hosted text model: no Google key needed for this stage.
         client = None
@@ -2415,6 +2424,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
             if gaming:
                 prompt += '\nFor gaming, prefer windows with a setup, an identifiable action, and its immediate outcome. Penalize reactions without context.'
+            elif podcast:
+                prompt += '\nFor podcasts, score complete conversational ideas with a spoken hook, concise context, and a satisfying answer, insight, or punchline. Downrank fragments with an unresolved setup or cutoff payoff.'
             return prompt
 
         for batch in score_batches(windows, SCORE_BATCH):
@@ -2450,12 +2461,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
-                return prompt + (gemini_worker.GAMING_STORY_RULES if gaming else '')
+                return prompt + story_rules
             return build
 
         shorts = _run_stage_split(client, model_name, shortlist,
                                   _detail_prompt_for(min_clips, max_clips),
-                                  gemini_worker.DetailResponse, "shorts", costs, "detail")
+                                  detail_schema, "shorts", costs, "detail")
 
         # The floor lived only in the prompt, and a prompt is not a contract:
         # the model regularly returned half of it and the job shipped that.
@@ -2473,13 +2484,13 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                 extra = _run_stage_split(
                     client, model_name, spare,
                     _detail_prompt_for(missing, max(missing, len(spare))),
-                    gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
+                    detail_schema, "shorts", costs, "detail-floor")
                 if extra:
                     shorts = sorted(shorts + extra,
                                     key=lambda s: float(s.get("start") or 0))
                     print(f"   Recovered {len(extra)} clip(s) from them.")
 
-        if len(shorts) > max_clips:
+        if not podcast and len(shorts) > max_clips:
             # By score, never by position: the results arrive in transcript
             # order, so slicing kept the earliest clips and silently dropped
             # the back half of the video. See trim_to_best.
@@ -2488,6 +2499,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             print(f"   Kept the {max_clips} best-scoring clip(s) of "
                   f"{max_clips + dropped}.")
         # Snap each proposed clip onto real word boundaries (+ a bit of silence).
+        complete = []
         for s in shorts:
             # Keep the model's raw proposal: it is how boundary accuracy is
             # measured (distance to the nearest word before the snap; p90 was
@@ -2496,15 +2508,24 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             if gaming:
                 # Preserve the visual handles even in the silence between words.
                 ns, ne = gaming_story_range(s, video_duration, min_secs, max_secs)
+            elif podcast:
+                bounds = podcast_story_range(s, words, video_duration, min_secs, max_secs)
+                if bounds is None:
+                    continue
+                ns, ne = bounds
             else:
                 ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
                                             min_duration=min_secs, max_duration=max_secs)
             s["start"], s["end"] = ns, ne
+            complete.append(s)
+        if len(complete) < len(shorts):
+            print(f"   Skipped {len(shorts) - len(complete)} podcast moment(s) without a complete cut.")
+        shorts = complete
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "
                   f"better-scored one.")
-            shorts = deduped
+        shorts = trim_to_best(deduped, max_clips) if podcast else deduped
 
         # Aggregate cost across both passes.
         cost_analysis = None
@@ -2700,7 +2721,7 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
             return default
     v_min_clips = _env_int("CLIP_TARGET_MIN", 3)
     v_max_clips = max(v_min_clips, _env_int("CLIP_TARGET_MAX", 15))
-    gaming = os.getenv('CLIP_LAYOUT_PRESET') == 'gaming'
+    gaming = _clip_selection_mode() == 'gaming'
     v_min_secs, v_max_secs = clip_duration_bounds(gaming=gaming)
     gaming_hint = gemini_worker.GAMING_STORY_RULES if gaming else ''
 
@@ -3129,6 +3150,9 @@ if __name__ == '__main__':
             clips_data['output_format'] = output_format
             if layout_preset:
                 clips_data['layout_preset'] = layout_preset
+            clip_mode = _clip_selection_mode()
+            if clip_mode:
+                clips_data['clip_mode'] = clip_mode
             if os.environ.get("AUTO_CAPTIONS", "1").strip() == "0":
                 clips_data['auto_captions'] = False
             if source_subtitle_band:

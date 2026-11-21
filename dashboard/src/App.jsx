@@ -789,6 +789,11 @@ function App() {
         if (session.activeTab) setActiveTab(session.activeTab);
         // If was processing, resume polling; if complete/error, just show results
         setStatus(session.status === 'processing' ? 'processing' : session.status);
+        if (session.status === 'complete') {
+          pollJob(session.jobId).then((data) => {
+            if (data.result && jobIdRef.current === session.jobId) setResults(data.result);
+          }).catch(() => { /* retain the last known results while the server is unavailable */ });
+        }
         setSessionRecovered(true);
         setTimeout(() => setSessionRecovered(false), 5000);
       }
@@ -1289,6 +1294,7 @@ function App() {
         captions: data.autoCaptions == null ? null : (data.autoCaptions ? '1' : '0'),
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
+        clip_mode: data.clipMode ?? null,
         // Set when the user took the quota wall's "clip the first N minutes"
         // offer: the server reserves N minutes and cuts the source to them.
         max_minutes: data.maxMinutes || null,

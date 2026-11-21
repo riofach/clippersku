@@ -1542,6 +1542,17 @@ def _canonical_clip_file(output_dir, base_name, index):
     return os.path.basename(max(derived, key=os.path.getmtime))
 
 
+def _clip_edit_filename(output_dir, metadata_path, index, clip, job, override=None):
+    """Resolve the published edit first, including jobs without saved URLs yet."""
+    if override:
+        return os.path.basename(override)
+    if clip.get('video_url'):
+        return os.path.basename(clip['video_url'].split('?', 1)[0])
+    ready = (job.get('ready_files') or {}).get(index)
+    base = os.path.basename(metadata_path).removesuffix('_metadata.json')
+    return os.path.basename(ready) if ready else _canonical_clip_file(output_dir, base, index)
+
+
 def _clips_actually_rendered(job_id, output_dir, base_name, clips):
     """Keep only the clips whose file is really on disk. Returns (kept, missing).
 
@@ -6113,6 +6124,7 @@ async def process_endpoint(
     acknowledged: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     layouts: Optional[str] = Form(None),
+    clip_mode: Optional[str] = Form(None),
     force_low_quality: Optional[str] = Form(None),
     webhook_url: Optional[str] = Form(None),
     webhook_secret: Optional[str] = Form(None),
@@ -6148,6 +6160,7 @@ async def process_endpoint(
         force_low = bool(body.get("force_low_quality"))
         output_format = body.get("output_format")
         layouts = body.get("layouts")
+        clip_mode = body.get("clip_mode")
         webhook_url = body.get("webhook_url")
         webhook_secret = body.get("webhook_secret")
         target_clips = body.get("target_clips")
@@ -6165,6 +6178,9 @@ async def process_endpoint(
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
         output_format = "auto"
+
+    if clip_mode not in (None, "podcast", "gaming"):
+        raise HTTPException(status_code=400, detail="Clip mode must be podcast or gaming.")
 
     # Accepts a JSON list or a comma-separated form field.
     if isinstance(layouts, str):
@@ -6259,6 +6275,8 @@ async def process_endpoint(
     # the subprocess, so they must be set before Popen — same path WATERMARK
     # already takes.
     env.update(chosen)
+    if clip_mode:
+        env["CLIP_SELECTION_MODE"] = clip_mode
     if chosen:
         print(f"[layouts] job={job_id} enabled={sorted(chosen)}")
 
@@ -8896,16 +8914,8 @@ async def _add_subtitles_locked(req, request, job):
             sub_start, sub_end = 0.0, sub_transcript["segments"][0]["end"]
             caption_words = sub_transcript["segments"][0]["words"]
 
-    # Video Path
-    if req.input_filename:
-        # Use chained file
-        filename = os.path.basename(req.input_filename)
-    else:
-        # Fallback to standard naming
-        filename = clip_data.get('video_url', '').split('/')[-1]
-        if not filename:
-             base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-             filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
+    filename = _clip_edit_filename(output_dir, json_files[0], req.clip_index,
+                                   clip_data, job, req.input_filename)
 
     caption_style = {k: getattr(req, k) for k in CAPTION_STYLE_FIELDS}
     clean_current = _strip_watermark_copy(output_dir, filename)
@@ -9099,11 +9109,8 @@ async def _remove_subtitles_locked(req, request, job):
     if req.clip_index < 0 or req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    filename = os.path.basename(
-        req.input_filename
-        or (clips[req.clip_index].get('video_url') or '').split('/')[-1]
-        or f"{os.path.basename(json_files[0]).replace('_metadata.json', '')}"
-           f"_clip_{req.clip_index + 1}.mp4")
+    filename = _clip_edit_filename(output_dir, json_files[0], req.clip_index,
+                                   clips[req.clip_index], job, req.input_filename)
 
     # Same walk-back the burn path uses, so this undoes any number of restyles.
     filename = await asyncio.to_thread(_strip_burned_captions, output_dir, filename)
@@ -9280,14 +9287,8 @@ async def _add_hook_locked(req, request, job):
         
     clip_data = clips[req.clip_index]
     
-    # Video Path
-    if req.input_filename:
-        filename = os.path.basename(req.input_filename)
-    else:
-        filename = clip_data.get('video_url', '').split('/')[-1]
-        if not filename:
-             base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-             filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
+    filename = _clip_edit_filename(output_dir, json_files[0], req.clip_index,
+                                   clip_data, job, req.input_filename)
          
     input_path = os.path.join(output_dir, filename)
     if not os.path.exists(input_path):
@@ -9347,7 +9348,7 @@ async def _add_hook_locked(req, request, job):
                 await _metering.release_reservation(reservation_id)
             if isinstance(e, HTTPException):
                 raise
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail="Could not render the hook. The existing clip is still available.") from e
 
         if reservation_id:
             await _metering.commit_reservation(reservation_id)

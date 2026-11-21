@@ -70,6 +70,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [layout, setLayout] = useState(() => {
         try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
     });
+    const [clipMode, setClipMode] = useState(() => {
+        try {
+            const saved = localStorage.getItem('os_clip_mode');
+            if (saved === 'podcast' || saved === 'gaming') return saved;
+        } catch { /* ignore */ }
+        return layout === 'gaming' ? 'gaming' : 'podcast';
+    });
     const infoRef = useRef(null);
 
     // Close the compatibility popover on any outside click.
@@ -133,6 +140,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             autoHook,
             autoCaptions,
             autoHookStyle,
+            clipMode,
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
@@ -142,6 +150,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_auto_captions', autoCaptions ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
+            localStorage.setItem('os_clip_mode', clipMode);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
@@ -316,6 +325,49 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 </div>
 
+                <div className="mt-4 space-y-3 border-t border-rule pt-3">
+                    <fieldset>
+                        <legend className="mb-2 text-xs text-ink2">Clip mode</legend>
+                        <div className="grid grid-cols-2 gap-2">
+                            {['Podcast', 'Gaming'].map((label) => (
+                                <label key={label} className={`flex cursor-pointer items-center justify-center gap-2 rounded-input border px-3 py-2 text-xs ${clipMode === label.toLowerCase() ? 'border-brass text-ink' : 'border-rule text-muted'}`}>
+                                    <input type="radio" name="clip-mode" value={label.toLowerCase()}
+                                        checked={clipMode === label.toLowerCase()}
+                                        onChange={(event) => setClipMode(event.target.value)}
+                                        className="accent-[var(--color-accent)]" />
+                                    {label}
+                                </label>
+                            ))}
+                        </div>
+                        <p className="mt-1.5 text-xs text-muted">
+                            {clipMode === 'podcast' ? 'Spoken hook → enough context → complete payoff.'
+                                : 'Lead-in → gameplay moment → outcome or reaction.'}
+                        </p>
+                    </fieldset>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <label htmlFor="vertical-layout" className="text-xs text-ink2">Vertical layout</label>
+                        <select id="vertical-layout" value={layout} onChange={(e) => {
+                            setLayout(e.target.value);
+                            if (['gaming', 'panel'].includes(e.target.value)) setOutputFormat('vertical');
+                        }} className="input-field !w-auto max-w-full text-xs py-1.5">
+                            <option value="auto">Auto (AI picks per video)</option>
+                            <option value="split">Two speakers stacked</option>
+                            <option value="panel">Podcast · 3–4 people (2×2)</option>
+                            <option value="gaming">Gaming · 60% gameplay / 40% facecam</option>
+                            <option value="screencast">Screen over presenter</option>
+                            <option value="none">Single crop only</option>
+                        </select>
+                        {['gaming', 'panel'].includes(layout) && (
+                            <p className="w-full text-[11px] leading-relaxed text-muted">
+                                {layout === 'gaming'
+                                    ? 'Use a recording with the facecam visible. Gameplay fills the top panel and crops its sides.'
+                                    : 'Use a wide shot with the speakers visible together. Three faces leave one tile for the wide shot.'}
+                                {' '}Adjust the crop boxes in Reframing after the clips are ready.
+                            </p>
+                        )}
+                    </div>
+                </div>
+
                 {/* Advanced generation controls — collapsed by default; blank = AI decides */}
                 <div className="mt-4">
                     <button
@@ -349,7 +401,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     type="number" min="5" max="175" step="1"
                                     value={clipMinSeconds}
                                     onChange={(e) => setClipMinSeconds(e.target.value)}
-                                    placeholder={layout === 'gaming' ? '25' : '15'}
+                                    placeholder={clipMode === 'gaming' ? '25' : '15'}
                                     className="input-field"
                                 />
                             </div>
@@ -359,7 +411,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     type="number" min="10" max="180" step="1"
                                     value={clipMaxSeconds}
                                     onChange={(e) => setClipMaxSeconds(e.target.value)}
-                                    placeholder={layout === 'gaming' ? '75' : '60'}
+                                    placeholder={clipMode === 'gaming' ? '75' : '60'}
                                     className="input-field"
                                 />
                             </div>
@@ -368,35 +420,6 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 material doesn't hold them. Leave blank to let it decide.
                                 {plan === 'free' && ` The free plan makes the ${FREE_CLIPS_PER_VIDEO} to ${FREE_CLIPS_QUIET} best clips of each video, fewer while its queue is busy; plans get every clip, up to ${MAX_CLIPS_PER_VIDEO}.`}
                             </p>
-                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
-                                <span className="text-xs text-ink2">vertical layout</span>
-                                <select
-                                    value={layout}
-                                    onChange={(e) => {
-                                        setLayout(e.target.value);
-                                        if (['gaming', 'panel'].includes(e.target.value)) {
-                                            setOutputFormat('vertical');
-                                        }
-                                    }}
-                                    className="input-field !w-auto max-w-full text-xs py-1.5"
-                                    aria-label="vertical layout"
-                                >
-                                    <option value="auto">Auto (AI picks per video)</option>
-                                    <option value="split">Two speakers stacked</option>
-                                    <option value="panel">Podcast · 3–4 people (2×2)</option>
-                                    <option value="gaming">Gaming · 60% gameplay / 40% facecam</option>
-                                    <option value="screencast">Screen over presenter</option>
-                                    <option value="none">Single crop only</option>
-                                </select>
-                                {['gaming', 'panel'].includes(layout) && (
-                                    <p className="w-full text-[11px] leading-relaxed text-muted">
-                                        {layout === 'gaming'
-                                            ? 'Use a recording with the facecam visible. Gameplay fills the top panel and crops its sides.'
-                                            : 'Use a wide shot with the speakers visible together. Three faces leave one tile for the wide shot.'}
-                                        {' '}Adjust the crop boxes in Reframing after the clips are ready.
-                                    </p>
-                                )}
-                            </div>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
                                     <input

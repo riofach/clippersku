@@ -242,6 +242,55 @@ def gaming_story_range(clip, duration, min_duration, max_duration):
     return round(left, 3), round(right, 3)
 
 
+def selection_mode(mode, layout):
+    """Keep the legacy Gaming layout behavior for callers without a mode."""
+    if mode in ('podcast', 'gaming'):
+        return mode
+    return 'gaming' if layout == 'gaming' else None
+
+
+def podcast_story_range(clip, words, duration, min_duration, max_duration):
+    """Include the needed setup and payoff, even if the proposed cut misses one."""
+    start, end = clip['start'], clip['end']
+    if not (math.isfinite(start) and math.isfinite(end) and start < end):
+        return None
+    start, end = max(0.0, start), min(duration, end)
+    if start >= end:
+        return None
+
+    setup, payoff = clip.get('setup_start'), clip.get('payoff_end')
+    if not (isinstance(setup, (float, int)) and 0 <= setup < end):
+        setup = None
+    if not (isinstance(payoff, (float, int)) and start < payoff <= duration):
+        payoff = None
+    if setup is not None and payoff is not None and setup >= payoff:
+        setup = payoff = None
+
+    if setup is not None:
+        start = min(start, setup)
+    if payoff is not None:
+        end = max(end, payoff)
+    if end - start > max_duration:
+        # Keep the complete marked conversation; skip a moment whose essential
+        # beats do not fit rather than truncating its conclusion.
+        if setup is None or payoff is None or payoff - setup > max_duration:
+            return None
+        start, end = setup, payoff
+
+    min_duration = min(min_duration, duration)
+    if end - start < min_duration:
+        end = min(duration, start + min_duration)
+        start = max(0.0, min(start, end - min_duration))
+    snapped_start, snapped_end = snap_clip_to_words(
+        start, end, words, duration, min_duration=min_duration, max_duration=max_duration)
+    if (snapped_start <= (setup if setup is not None else start)
+            and snapped_end >= (payoff if payoff is not None else end)
+            and 0 <= snapped_start < snapped_end <= duration
+            and min_duration - .001 <= snapped_end - snapped_start <= max_duration + .001):
+        return snapped_start, snapped_end
+    return round(start, 3), round(end, 3)
+
+
 def compact_words(words, precision=2):
     """Round word timestamps for prompts — full float precision wastes tokens."""
     return [

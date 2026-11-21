@@ -61,7 +61,7 @@ function loadHookPrefs() {
     try { return JSON.parse(localStorage.getItem('os_hook_prefs')) || {}; } catch { return {}; }
 }
 
-export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText,
+export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText, saveError,
     durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook, existingHook, jobId, clipIndex }) {
     const [prefs] = useState(loadHookPrefs);
     const saved = existingHook || burnedHook;
@@ -305,6 +305,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                         </div>
                     </div>
 
+                    {saveError && <p role="alert" className="mt-4 text-xs text-warn">{saveError}</p>}
                     <div className="flex gap-2 mt-5 shrink-0">
                         <button onClick={onClose} className="btn-ghost">
                             cancel

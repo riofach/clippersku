@@ -52,6 +52,31 @@ class TestStripBurnedHook:
 
 
 class TestLayerChain:
+    def test_remove_captions_preserves_hook_when_generated_metadata_has_no_url(self, tmp_path, monkeypatch):
+        import json
+        import hooks
+
+        job_id = "fresh-clip"
+        directory = tmp_path / job_id
+        directory.mkdir()
+        metadata = directory / 'base_metadata.json'
+        metadata.write_text(json.dumps({"shorts": [{"auto_hook": {"text": "The hook"}}]}))
+        for name in (CLEAN, CAPTIONED_HOOKED):
+            _touch(directory, name)
+        recipe, _ = hooks.recipe_paths(directory, HOOKED)
+        open(recipe, 'w').close()
+        monkeypatch.setattr(hooks, 'materialize', lambda root, name: bool(_touch(root, name)))
+        monkeypatch.setattr(app_module, 'OUTPUT_DIR', str(tmp_path))
+        monkeypatch.setattr(app_module, 'BILLING_ENABLED', False)
+        monkeypatch.setenv('HIHUCLIP_WATERMARK', '0')
+        job = {"ready_files": {0: CAPTIONED_HOOKED}, "result": {"clips": [{}]}}
+        request = app_module.RemoveSubtitlesRequest(job_id=job_id, clip_index=0)
+        response = asyncio.run(app_module._remove_subtitles_locked(request, None, job))
+        assert response['new_video_url'] == f'/videos/{job_id}/{HOOKED}'
+        saved = json.loads(metadata.read_text())['shorts'][0]
+        assert saved['auto_hook']['text'] == 'The hook'
+        assert saved['video_url'] == response['new_video_url']
+
     def test_captioned_hook_strips_in_two_steps(self, tmp_path):
         """subtitled_<ts>_hooked_<ts>_<clean> -> hooked -> clean, the exact
         order /api/hook uses to REPLACE a hook without stacking."""

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp, Sparkles } from 'lucide-react';
 import { getApiUrl } from '../config';
-import { apiFetch, QuotaError, openQuotaWall } from '../lib/api';
+import { apiFetch, apiJson, QuotaError, openQuotaWall } from '../lib/api';
 import { platformOptions as buildPlatformOptions, defaultPlatformFlags, flagsFromList } from '../lib/socialPlatforms';
 import { track } from '../lib/analytics';
 import SubtitleModal from './SubtitleModal';
@@ -339,6 +339,9 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // one). /api/hook REPLACES it; tracked locally so the modal stays honest
     // after edits without refetching the job.
     const [burnedHook, setBurnedHook] = useState(clip.auto_hook?.text ? clip.auto_hook : null);
+    const [hookError, setHookError] = useState(null);
+    const renderHookOnServer = hasServerBurns || !!burnedHook
+        || (/^wm_/.test(serverVideoFile || '') && !Object.values(activeLayers).some(Boolean));
 
     // Fetch clip duration from transcript endpoint
     useEffect(() => {
@@ -604,12 +607,11 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
 
     const handleHook = async (hookData) => {
         setIsHooking(true);
-        setEditError(null);
+        setHookError(null);
         try {
-            if (hookData.remotion && !hasServerBurns) {
+            if (hookData.remotion && !renderHookOnServer) {
                 // Accumulate layer and render all layers together
                 const newLayers = { ...activeLayers, hook: hookData.remotion };
-                setActiveLayers(newLayers);
                 const blobUrl = await renderInBrowser({
                     videoUrl: originalVideoUrl,
                     durationInSeconds: clipDuration,
@@ -617,6 +619,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     hook: newLayers.hook,
                     effects: newLayers.effects,
                 });
+                setActiveLayers(newLayers);
                 setCurrentVideoUrl(blobUrl);
                 if (videoRef.current) videoRef.current.load();
                 setShowHookModal(false);
@@ -628,7 +631,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 ? { text: hookData, position: 'top', size: 'M' }
                 : hookData;
 
-            const res = await apiFetch('/api/hook', {
+            const data = await apiJson('/api/hook', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -644,8 +647,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 })
             });
 
-            if (!res.ok) throw new Error(await res.text());
-            const data = await res.json();
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
                 setServerVideoFile(data.new_video_url.split('/').pop());
@@ -654,8 +655,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 setShowHookModal(false);
             }
         } catch (e) {
-            setEditError(e.message);
-            setTimeout(() => setEditError(null), 5000);
+            setHookError(typeof e.detail === 'string' && e.detail
+                ? e.detail : 'Could not render the hook. The existing clip is still available.');
         } finally {
             setIsHooking(false);
         }
@@ -1122,7 +1123,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     </button>
 
                     <button
-                        onClick={() => setShowHookModal(true)}
+                        onClick={() => { setHookError(null); setShowHookModal(true); }}
                         disabled={isHooking}
                         className={QUIET_BTN}
                     >
@@ -1355,7 +1356,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 durationInSeconds={clip.end && clip.start ? clip.end - clip.start : 30}
                 existingSubtitles={activeLayers.subtitles}
                 hasCaptions={!!activeLayers.subtitles || /(^|_)subtitled_/.test(serverVideoFile || '')}
-                serverRender={hasServerBurns}
+                serverRender={renderHookOnServer}
+                saveError={hookError}
                 burnedHook={burnedHook}
                 onRemove={burnedHook ? handleRemoveHook : null}
             />}

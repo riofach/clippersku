@@ -52,6 +52,15 @@ class DetailResponse(BaseModel):
     shorts: List[DetailClipModel]
 
 
+class PodcastClipModel(DetailClipModel):
+    setup_start: Optional[float] = None
+    payoff_end: Optional[float] = None
+
+
+class PodcastDetailResponse(BaseModel):
+    shorts: List[PodcastClipModel]
+
+
 # Visual (no-transcript) clip selection: Gemini watches a silent video and
 # picks moments from the imagery. Same output shape as DetailClipModel minus
 # the transcript-only source_window_id.
@@ -78,6 +87,15 @@ GAMING EDITING RULES (take priority over the 2-second opening rule):
 - Let the result land before ending. Cut dead time and unrelated chatter, not the action or reaction.
 - For each pick, when identifiable, return numeric event_start and event_end for the action itself, using the same timestamps as start and end.
 - With transcript-only input, use dialogue and sound cues as evidence and leave event timestamps unset when the action is ambiguous. Title the moment without inventing what happened on screen.
+"""
+
+
+PODCAST_STORY_RULES = """
+PODCAST EDITING RULES (take priority over the 2-second opening rule):
+- Pick one self-contained idea in the original speaking order: a spoken hook, only the context a new viewer needs, and a complete payoff.
+- Open on a question, a clear claim, or an engaging line that the conversation actually contains. If the answer relies on the host's question or a reference to an earlier person or idea, include that setup.
+- End only after the speaker finishes the answer, insight, example, or punchline. For a disputed claim, retain the relevant qualification or immediate response when it changes the meaning.
+- Use numeric setup_start and payoff_end (absolute seconds) to mark the first indispensable line and the end of the complete payoff. Skip ideas that cannot fit intact in the duration limit. Avoid padding, cliffhangers, and unrelated chatter.
 """
 
 

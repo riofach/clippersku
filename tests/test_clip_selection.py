@@ -2,13 +2,16 @@
 import re
 
 import pytest
-from clip_selection import clip_duration_bounds, gaming_story_range
 
 from clip_selection import (
     build_transcript_windows,
     clip_count_targets,
+    clip_duration_bounds,
     dedupe_overlapping,
+    gaming_story_range,
+    podcast_story_range,
     score_batches,
+    selection_mode,
     shortlist_target,
     snap_clip_to_words,
     compact_words,
@@ -41,6 +44,24 @@ def test_gaming_defaults_are_longer_and_honor_explicit_max(monkeypatch):
     assert clip_duration_bounds(gaming=True) == (25, 75)
     monkeypatch.setenv('CLIP_MAX_SECONDS', '45')
     assert clip_duration_bounds(gaming=True) == (25, 45)
+
+
+def test_explicit_clip_mode_takes_precedence_over_the_layout():
+    assert selection_mode('podcast', 'gaming') == 'podcast'
+    assert selection_mode('gaming', 'panel') == 'gaming'
+    assert selection_mode(None, 'gaming') == 'gaming'
+    assert selection_mode(None, 'panel') is None
+
+
+def test_podcast_cut_includes_question_and_payoff_even_if_word_snap_would_crop_them():
+    clip = {'start': 42, 'end': 55, 'setup_start': 40, 'payoff_end': 58}
+    words = [_word('question', 40.5, 41), _word('answer', 48, 49), _word('example', 57, 57.5)]
+    assert podcast_story_range(clip, words, 100, 15, 60) == (40, 58)
+
+
+def test_podcast_leaves_out_a_story_that_cannot_fit_before_the_payoff():
+    clip = {'start': 20, 'end': 50, 'setup_start': 5, 'payoff_end': 80}
+    assert podcast_story_range(clip, [], 100, 15, 60) is None
 
 
 class TestBuildTranscriptWindows:
